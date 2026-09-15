@@ -1456,6 +1456,185 @@ class AgyPoolTest(unittest.TestCase):
             agy_pool.main()
         self.assertEqual(cm.exception.code, 1)
 
+    def test_compute_capacity_state_math_and_fallbacks(self):
+        now = 1726400000.0
+
+        # Positive pace (surplus: 60% remaining with 30m left in 5h window)
+        acc_surplus = {
+            "last_quota": {
+                "gemini_5h": {"fraction": 0.60, "reset_time": now + 1800},
+                "gemini_weekly": {"fraction": 0.70, "reset_time": now + 10800},
+            }
+        }
+        cap = agy_pool.compute_capacity_state(acc_surplus, now=now)
+        # r5 = 1800 / 18000 = 0.10 -> pace5 = 0.60 - 0.10 = 0.50
+        self.assertAlmostEqual(cap["pace5"], 0.50, places=4)
+        self.assertAlmostEqual(cap["pace7"], 0.70 - (10800 / 604800.0), places=4)
+        self.assertAlmostEqual(cap["worst_pace"], 0.50, places=4)
+        self.assertFalse(cap["is_depleted"])
+
+        # Clamping: future reset beyond window clamped to r=1.0
+        acc_clamped = {
+            "last_quota": {
+                "gemini_5h": {"fraction": 0.90, "reset_time": now + 36000},  # 10h > 5h
+                "gemini_weekly": {"fraction": 0.90, "reset_time": now + 1000000},  # > 7d
+            }
+        }
+        cap_c = agy_pool.compute_capacity_state(acc_clamped, now=now)
+        self.assertEqual(cap_c["r5"], 1.0)
+        self.assertEqual(cap_c["r7"], 1.0)
+        self.assertAlmostEqual(cap_c["pace5"], -0.10, places=4)
+        self.assertAlmostEqual(cap_c["pace7"], -0.10, places=4)
+
+        # Past/stale reset time (t <= 0) falls back to r=1.0
+        acc_stale = {
+            "last_quota": {
+                "gemini_5h": {"fraction": 0.80, "reset_time": now - 100},
+                "gemini_weekly": {"fraction": 0.80, "reset_time": now},
+            }
+        }
+        cap_s = agy_pool.compute_capacity_state(acc_stale, now=now)
+        self.assertEqual(cap_s["r5"], 1.0)
+        self.assertEqual(cap_s["r7"], 1.0)
+        self.assertAlmostEqual(cap_s["worst_pace"], -0.20, places=4)
+
+        # Missing reset time falls back to r=1.0
+        acc_missing = {"last_quota": {"remaining_fraction": 0.75}}
+        cap_m = agy_pool.compute_capacity_state(acc_missing, now=now)
+        self.assertEqual(cap_m["r5"], 1.0)
+        self.assertEqual(cap_m["r7"], 1.0)
+        self.assertAlmostEqual(cap_m["worst_pace"], -0.25, places=4)
+
+        # Hard quota floor: min(q5, q7) <= 0.005 marks is_depleted = True
+        acc_depleted = {
+            "last_quota": {
+                "gemini_5h": {"fraction": 0.003, "reset_time": now + 60},
+                "gemini_weekly": {"fraction": 0.90, "reset_time": now + 86400},
+            }
+        }
+        cap_d = agy_pool.compute_capacity_state(acc_depleted, now=now)
+        self.assertTrue(cap_d["is_depleted"])
+        self.assertAlmostEqual(cap_d["raw_floor"], 0.003, places=4)
+
+    def test_max_quota_reset_aware_scenarios(self):
+        now = 1726400000.0
+
+        # Scenario A: Misleading high raw quota vs moderate quota resetting soon
+        # Account A: 90% (5h away), 90% (7d away) -> worst pace -0.10
+        # Account B: 60% (30m away), 70% (3h away) -> worst pace +0.50
+        acc_a = account("acc_a")
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.90, "reset_time": now + 18000},
+            "gemini_weekly": {"fraction": 0.90, "reset_time": now + 604800},
+        }
+        acc_b = account("acc_b")
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.60, "reset_time": now + 1800},
+            "gemini_weekly": {"fraction": 0.70, "reset_time": now + 10800},
+        }
+        ordered = agy_pool.order_candidates([acc_a, acc_b], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_b", "acc_a"])
+
+        # Scenario B: Weekly bottleneck protection
+        # Account A: 80% 5h (1h away), 10% weekly (6d away) -> worst pace ≈ -0.757
+        # Account B: 50% 5h (2.5h away), 50% weekly (3.5d away) -> worst pace 0.0
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.80, "reset_time": now + 3600},
+            "gemini_weekly": {"fraction": 0.10, "reset_time": now + (6 * 86400)},
+        }
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.50, "reset_time": now + 9000},
+            "gemini_weekly": {"fraction": 0.50, "reset_time": now + (3.5 * 86400)},
+        }
+        ordered = agy_pool.order_candidates([acc_a, acc_b], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_b", "acc_a"])
+
+        # Scenario C: 5-Hour bottleneck protection
+        # Account A: 15% 5h (4.5h away), 85% weekly (1d away) -> worst pace -0.75
+        # Account B: 40% 5h (2h away), 40% weekly (2d away) -> worst pace 0.0
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.15, "reset_time": now + 16200},
+            "gemini_weekly": {"fraction": 0.85, "reset_time": now + 86400},
+        }
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.40, "reset_time": now + 7200},
+            "gemini_weekly": {"fraction": 0.40, "reset_time": now + (2 * 86400)},
+        }
+        ordered = agy_pool.order_candidates([acc_a, acc_b], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_b", "acc_a"])
+
+        # Scenario D: Hard depletion floor overrides pace score
+        # Account A: 0.2% quota resetting in 1 minute (depleted)
+        # Account B: 20% quota resetting in 4 hours (healthy eligible)
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.002, "reset_time": now + 60},
+            "gemini_weekly": {"fraction": 0.80, "reset_time": now + 86400},
+        }
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.20, "reset_time": now + 14400},
+            "gemini_weekly": {"fraction": 0.20, "reset_time": now + (5 * 86400)},
+        }
+        ordered = agy_pool.order_candidates([acc_a, acc_b], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_b", "acc_a"])
+
+        # Scenario E: Missing reset time fallback
+        # Account A has 80% with no reset (worst_pace = -0.20)
+        # Account B has 70% with reset in 1h 5h and 1d weekly (worst_pace = +0.50)
+        acc_a["last_quota"] = {"remaining_fraction": 0.80}
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.70, "reset_time": now + 3600},
+            "gemini_weekly": {"fraction": 0.70, "reset_time": now + 86400},
+        }
+        ordered = agy_pool.order_candidates([acc_a, acc_b], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_b", "acc_a"])
+
+        # Both missing reset: raw quota ranking preserved
+        acc_b["last_quota"] = {"remaining_fraction": 0.70}
+        ordered = agy_pool.order_candidates([acc_a, acc_b], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_a", "acc_b"])
+
+        # Scenario F: Stable exact tie
+        acc_1 = account("acc_1")
+        acc_1["last_quota"] = {"remaining_fraction": 0.80}
+        acc_2 = account("acc_2")
+        acc_2["last_quota"] = {"remaining_fraction": 0.80}
+        ordered = agy_pool.order_candidates([acc_1, acc_2], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_1", "acc_2"])
+
+    def test_least_used_reset_aware_tie_breaking(self):
+        now = 1726400000.0
+        # Hits is primary: lower hits account always selected first
+        acc_few_hits = account("few_hits")
+        acc_few_hits["gen_count"] = 1
+        acc_few_hits["last_quota"] = {
+            "gemini_5h": {"fraction": 0.20, "reset_time": now + 14400},
+            "gemini_weekly": {"fraction": 0.20, "reset_time": now + 400000},
+        }
+        acc_many_hits = account("many_hits")
+        acc_many_hits["gen_count"] = 10
+        acc_many_hits["last_quota"] = {
+            "gemini_5h": {"fraction": 0.90, "reset_time": now + 1800},
+            "gemini_weekly": {"fraction": 0.90, "reset_time": now + 10800},
+        }
+        ordered = agy_pool.order_candidates([acc_many_hits, acc_few_hits], strategy="least_used", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["few_hits", "many_hits"])
+
+        # Equal hits: reset-aware capacity pace tie-breaks
+        acc_low_cap = account("low_cap")
+        acc_low_cap["gen_count"] = 3
+        acc_low_cap["last_quota"] = {
+            "gemini_5h": {"fraction": 0.30, "reset_time": now + 14400},  # worst_pace = 0.30 - 0.80 = -0.50
+            "gemini_weekly": {"fraction": 0.80, "reset_time": now + 86400},
+        }
+        acc_high_cap = account("high_cap")
+        acc_high_cap["gen_count"] = 3
+        acc_high_cap["last_quota"] = {
+            "gemini_5h": {"fraction": 0.60, "reset_time": now + 1800},   # worst_pace = 0.60 - 0.10 = +0.50
+            "gemini_weekly": {"fraction": 0.80, "reset_time": now + 86400},
+        }
+        ordered = agy_pool.order_candidates([acc_low_cap, acc_high_cap], strategy="least_used", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["high_cap", "low_cap"])
+
 
 if __name__ == "__main__":
     unittest.main()

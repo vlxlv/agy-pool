@@ -80,6 +80,11 @@ The installer automatically validates the Python 3 runtime, installs global syml
 | `agy-pool verify [ID/Email]` | e.g. `verify 3` | Open Google Cloud Code security verification flow in browser |
 | `agy-pool remove <ID/Email>` | e.g. `remove 2` | Remove account from pool |
 
+> **Load balancing strategies**:
+> - `max_quota` (default): Prioritizes accounts with the safest remaining 5-hour and weekly quota, taking each reset time into account.
+> - `least_used`: Distributes load evenly to accounts with lowest AI generation count (Hits).
+> - `round_robin`: Cycles through ready accounts in sequential rotation.
+
 > **Note on targeting**: Numeric index targeting (e.g. `rename 1 "Work"`, `switch 2`, `remove 2`) is provided for interactive CLI convenience, but index numbers may shift after account removal, import, or replacement. For automated scripts and workflows, always prefer using the stable account ID or exact email address.
 
 ```text

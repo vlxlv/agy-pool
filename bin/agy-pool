@@ -1247,7 +1247,7 @@ def manage_strategy(target_strategy=None):
     if not target_strategy:
         print(f"\nCurrent load balancing strategy: {CLR_BOLD}{CLR_GREEN}{current}{CLR_RESET}\n")
         print("Available strategies:")
-        print(f"  • {CLR_BOLD}max_quota{CLR_RESET}   - Prioritizes accounts with highest remaining quota (default)")
+        print(f"  • {CLR_BOLD}max_quota{CLR_RESET}   - Prioritizes accounts with safest remaining 5-hour and weekly quota, taking reset times into account (default)")
         print(f"  • {CLR_BOLD}least_used{CLR_RESET}  - Distributes load evenly to accounts with lowest AI generation count (Hits)")
         print(f"  • {CLR_BOLD}round_robin{CLR_RESET} - Cycles through ready accounts in sequential rotation\n")
         print(f"To update strategy: {CLR_BOLD}agy-pool strategy <name>{CLR_RESET}\n")
@@ -1866,6 +1866,159 @@ def _is_timeout_error(error):
     return isinstance(error, urllib.error.URLError) and isinstance(error.reason, (socket.timeout, TimeoutError))
 
 
+WINDOW_5H_SECS = 18000.0   # 5 hours
+WINDOW_7D_SECS = 604800.0  # 7 days
+
+
+def _parse_iso_or_timestamp(val):
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        val = val.strip()
+        if not val or val.upper() in ("N/A", "NONE", "NULL", "READY"):
+            return None
+        try:
+            return float(val)
+        except ValueError:
+            pass
+        try:
+            clean = val.replace("Z", "+00:00")
+            return datetime.fromisoformat(clean).timestamp()
+        except Exception:
+            return None
+    return None
+
+
+def compute_capacity_state(account, now=None):
+    """
+    Computes reset-aware capacity metrics for an account across 5-hour and 7-day quota windows.
+
+    Pace metric: pace = remaining_fraction - (remaining_time / window_length).
+    Positive pace indicates capacity surplus above linear burn;
+    negative pace indicates capacity deficit / bottleneck.
+
+    Returns dict containing:
+      - q5, q7: raw remaining fractions in [0.0, 1.0]
+      - r5, r7: remaining time fractions of windows in [0.0, 1.0]
+      - pace5, pace7: capacity pace scores (q - r)
+      - worst_pace: min(pace5, pace7)
+      - total_pace: pace5 + pace7
+      - raw_floor: min(q5, q7)
+      - is_depleted: raw_floor <= 0.005
+    """
+    if now is None:
+        now = time.time()
+
+    q = account.get("last_quota")
+    if not isinstance(q, dict):
+        q = {}
+
+    # Extract 5-hour quota fraction
+    g5_dict = q.get("gemini_5h")
+    if isinstance(g5_dict, dict) and g5_dict.get("fraction") is not None:
+        raw_q5 = g5_dict.get("fraction")
+    elif q.get("remaining_fraction") is not None:
+        raw_q5 = q.get("remaining_fraction")
+    elif account.get("gemini_5h_pct") is not None:
+        raw_q5 = account.get("gemini_5h_pct") / 100.0
+    elif account.get("quota") is not None:
+        raw_q5 = account.get("quota")
+    else:
+        raw_q5 = 1.0
+
+    try:
+        q5 = max(0.0, min(1.0, float(raw_q5)))
+    except (ValueError, TypeError):
+        q5 = 1.0
+
+    # Extract weekly quota fraction
+    gw_dict = q.get("gemini_weekly")
+    if isinstance(gw_dict, dict) and gw_dict.get("fraction") is not None:
+        raw_q7 = gw_dict.get("fraction")
+    elif account.get("gemini_weekly_pct") is not None:
+        raw_q7 = account.get("gemini_weekly_pct") / 100.0
+    elif account.get("weekly_quota") is not None:
+        raw_q7 = account.get("weekly_quota")
+    elif q.get("remaining_fraction") is not None:
+        raw_q7 = q.get("remaining_fraction")
+    elif account.get("quota") is not None:
+        raw_q7 = account.get("quota")
+    else:
+        raw_q7 = 1.0
+
+    try:
+        q7 = max(0.0, min(1.0, float(raw_q7)))
+    except (ValueError, TypeError):
+        q7 = 1.0
+
+    # Extract reset timestamps or remaining seconds
+    reset_val_5 = None
+    if isinstance(g5_dict, dict):
+        reset_val_5 = g5_dict.get("reset_time")
+    if reset_val_5 is None:
+        reset_val_5 = q.get("reset_time")
+    if reset_val_5 is None:
+        reset_val_5 = account.get("gemini_5h_reset")
+
+    reset_val_7 = None
+    if isinstance(gw_dict, dict):
+        reset_val_7 = gw_dict.get("reset_time")
+    if reset_val_7 is None:
+        reset_val_7 = account.get("gemini_weekly_reset")
+
+    # 5-hour window ratio r5
+    if account.get("gemini_5h_reset_sec") is not None:
+        try:
+            t5 = float(account["gemini_5h_reset_sec"])
+            r5 = 1.0 if t5 <= 0 else min(1.0, t5 / WINDOW_5H_SECS)
+        except (ValueError, TypeError):
+            r5 = 1.0
+    else:
+        ts5 = _parse_iso_or_timestamp(reset_val_5)
+        if ts5 is None:
+            r5 = 1.0
+        else:
+            diff5 = ts5 - now
+            r5 = 1.0 if diff5 <= 0 else min(1.0, diff5 / WINDOW_5H_SECS)
+
+    # 7-day window ratio r7
+    if account.get("gemini_weekly_reset_sec") is not None:
+        try:
+            t7 = float(account["gemini_weekly_reset_sec"])
+            r7 = 1.0 if t7 <= 0 else min(1.0, t7 / WINDOW_7D_SECS)
+        except (ValueError, TypeError):
+            r7 = 1.0
+    else:
+        ts7 = _parse_iso_or_timestamp(reset_val_7)
+        if ts7 is None:
+            r7 = 1.0
+        else:
+            diff7 = ts7 - now
+            r7 = 1.0 if diff7 <= 0 else min(1.0, diff7 / WINDOW_7D_SECS)
+
+    pace5 = q5 - r5
+    pace7 = q7 - r7
+    worst_pace = min(pace5, pace7)
+    total_pace = pace5 + pace7
+    raw_floor = min(q5, q7)
+    is_depleted = (raw_floor <= 0.005)
+
+    return {
+        "q5": q5,
+        "q7": q7,
+        "r5": r5,
+        "r7": r7,
+        "pace5": pace5,
+        "pace7": pace7,
+        "worst_pace": worst_pace,
+        "total_pace": total_pace,
+        "raw_floor": raw_floor,
+        "is_depleted": is_depleted,
+    }
+
+
 def _get_remaining_fraction(acc):
     q = acc.get("last_quota", {})
     raw_f = q.get("remaining_fraction")
@@ -1880,14 +2033,16 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
     Orders account candidates for AI generation according to the chosen load balancing strategy.
 
     Tiers:
-      1. Eligible accounts: healthy quota (> 0.005), not rate-limited, not restricted.
-      2. Depleted accounts: quota <= 0.005, not rate-limited, not restricted.
+      1. Eligible accounts: healthy capacity (raw floor > 0.005), not rate-limited, not restricted.
+      2. Depleted accounts: raw quota floor <= 0.005, not rate-limited, not restricted.
       3. Cooldown accounts: rate_limited_until > now.
       4. Restricted accounts: validation_required or auth_error.
 
     Strategies applied strictly to the eligible account set:
-      - max_quota: Highest remaining fraction (binned by 0.01), breaking ties by lowest hits.
-      - least_used: Lowest generation count (Hits), breaking ties by highest quota, then account ID.
+      - max_quota: Prioritizes accounts with safest remaining 5-hour and weekly capacity (taking reset
+        times into account, binned by 0.01), breaking ties by total pace, raw floor, and lowest hits.
+      - least_used: Lowest generation count (Hits), breaking ties by reset-aware capacity pace,
+        raw quota floor, then account ID.
       - round_robin: Sequential rotation starting after round_robin_last_account_id, wrapping around.
 
     Depleted, cooldown, and restricted tiers follow behind in stable fallback order.
@@ -1909,20 +2064,26 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
         elif acc.get("rate_limited_until", 0) > now:
             cooldown.append(acc)
         else:
-            f = _get_remaining_fraction(acc)
-            if f <= 0.005:
+            cap = compute_capacity_state(acc, now=now)
+            if cap["is_depleted"]:
                 depleted.append(acc)
             else:
                 eligible.append(acc)
 
     # Strategy ordering on eligible accounts
     if strategy == "least_used":
-        # Lowest hits first, tie-break by higher remaining fraction, then account ID
-        eligible.sort(key=lambda a: (
-            a.get("gen_count", a.get("request_count", 0)),
-            -round(_get_remaining_fraction(a), 2),
-            a.get("id", "")
-        ))
+        # Lowest hits first, tie-break by reset-aware capacity, then stable account ID
+        def _least_used_key(a):
+            cap = compute_capacity_state(a, now=now)
+            hits = a.get("gen_count", a.get("request_count", 0))
+            return (
+                hits,
+                -round(cap["worst_pace"], 2),
+                -round(cap["total_pace"], 2),
+                -round(cap["raw_floor"], 2),
+                a.get("id", "")
+            )
+        eligible.sort(key=_least_used_key)
     elif strategy == "round_robin":
         # Rotate starting after round_robin_last_account_id
         last_id = pool.get("round_robin_last_account_id")
@@ -1930,15 +2091,21 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
             idx = next(i for i, a in enumerate(eligible) if a.get("id") == last_id)
             eligible = eligible[idx + 1:] + eligible[:idx + 1]
     else:
-        # Default: max_quota (behaviorally identical to pre-alpha9)
-        eligible.sort(key=lambda a: (
-            round(_get_remaining_fraction(a), 2),
-            -a.get("gen_count", a.get("request_count", 0))
-        ), reverse=True)
+        # Default: max_quota (reset-aware capacity scheduling)
+        def _max_quota_key(a):
+            cap = compute_capacity_state(a, now=now)
+            hits = a.get("gen_count", a.get("request_count", 0))
+            return (
+                round(cap["worst_pace"], 2),
+                -hits,
+                round(cap["total_pace"], 2),
+                round(cap["raw_floor"], 2)
+            )
+        eligible.sort(key=_max_quota_key, reverse=True)
 
     # Secondary tiers ordering
     depleted.sort(key=lambda a: (
-        _get_remaining_fraction(a),
+        round(compute_capacity_state(a, now=now)["raw_floor"], 2),
         -a.get("gen_count", a.get("request_count", 0))
     ), reverse=True)
 

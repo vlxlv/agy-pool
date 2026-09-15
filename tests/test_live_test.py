@@ -382,6 +382,48 @@ Refreshing quota for 1 account(s)...
         res_fail = verify_max_quota(["cooling@test.com"], accounts)
         self.assertFalse(res_fail["passed"])
 
+    def test_verify_max_quota_reset_aware(self):
+        now = 1726400000.0
+        accounts = [
+            {
+                "id": "acc_a",
+                "email": "a@test.com",
+                "last_quota": {
+                    "gemini_5h": {"fraction": 0.90, "reset_time": now + 18000},
+                    "gemini_weekly": {"fraction": 0.90, "reset_time": now + 604800},
+                },
+                "hits": 0,
+                "is_eligible": True,
+            },
+            {
+                "id": "acc_b",
+                "email": "b@test.com",
+                "last_quota": {
+                    "gemini_5h": {"fraction": 0.60, "reset_time": now + 1800},
+                    "gemini_weekly": {"fraction": 0.70, "reset_time": now + 10800},
+                },
+                "hits": 0,
+                "is_eligible": True,
+            },
+        ]
+        res = verify_max_quota(["b@test.com"], accounts, now=now)
+        self.assertTrue(res["passed"])
+
+        res_fail = verify_max_quota(["a@test.com"], accounts, now=now)
+        self.assertFalse(res_fail["passed"])
+        self.assertIn("expected highest-quota candidate 'b@test.com'", res_fail["reason"])
+
+    def test_parse_accounts_cli_reset_times(self):
+        text = (
+            "[1] a@test.com (Alice)  [Ready]  Hits: 0\n"
+            "    • Gemini 5-Hour: [████████░░]  80.0%  (Resets in 2h 30m)\n"
+            "    • Gemini Weekly: [████████░░]  80.0%  (Resets in 4d 1h)\n"
+        )
+        accounts = parse_accounts(text)
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0]["gemini_5h_reset_sec"], 9000.0)
+        self.assertEqual(accounts[0]["gemini_weekly_reset_sec"], 349200.0)
+
     def test_verify_least_used_quota_and_id_tie_break(self):
         accounts = [
             {"id": "acc_1", "email": "a@test.com", "hits": 0, "quota": 0.40, "is_eligible": True},

@@ -33,8 +33,35 @@ ACCOUNT_HEADER_RE = re.compile(
     r'^\s*\[(\d+)\]\s+(\S+)(.*?)\s+\[([^\]]+)\]\s+Hits:\s+(\d+)\s*$'
 )
 
-QUOTA_5H_RE = re.compile(r'Gemini 5-Hour:\s+\[.*?\]\s+([\d\.]+)%')
-QUOTA_WEEKLY_RE = re.compile(r'Gemini Weekly:\s+\[.*?\]\s+([\d\.]+)%')
+QUOTA_5H_RE = re.compile(r'Gemini 5-Hour:\s+\[.*?\]\s+([\d\.]+)%(?:\s+\(Resets\s+([^)]+)\))?')
+QUOTA_WEEKLY_RE = re.compile(r'Gemini Weekly:\s+\[.*?\]\s+([\d\.]+)%(?:\s+\(Resets\s+([^)]+)\))?')
+
+
+def _parse_human_reset_to_seconds(reset_str: Optional[str]) -> Optional[float]:
+    if not reset_str:
+        return None
+    s = reset_str.strip().lower()
+    if s in ("ready", "0m", "0s"):
+        return 0.0
+    if s in ("n/a", "none"):
+        return None
+    if s.startswith("in "):
+        s = s[3:].strip()
+    days = 0
+    hours = 0
+    minutes = 0
+    m_d = re.search(r'(\d+)\s*d', s)
+    if m_d:
+        days = int(m_d.group(1))
+    m_h = re.search(r'(\d+)\s*h', s)
+    if m_h:
+        hours = int(m_h.group(1))
+    m_m = re.search(r'(\d+)\s*m', s)
+    if m_m:
+        minutes = int(m_m.group(1))
+    if days == 0 and hours == 0 and minutes == 0:
+        return None
+    return float(days * 86400 + hours * 3600 + minutes * 60)
 
 # Patterns for agy-pool gateway proxy log lines
 LOG_PROXY_RE = re.compile(
@@ -124,6 +151,9 @@ def parse_accounts(text: str) -> List[Dict[str, Any]]:
                         "quota": eff_q,
                         "gemini_5h_pct": round(g5 * 100, 1) if g5 is not None else None,
                         "gemini_weekly_pct": round(gw * 100, 1) if gw is not None else None,
+                        "last_quota": q,
+                        "gemini_5h_reset": q.get("gemini_5h", {}).get("reset_time", q.get("reset_time")),
+                        "gemini_weekly_reset": q.get("gemini_weekly", {}).get("reset_time"),
                     })
                 return result
         except Exception:
@@ -195,6 +225,8 @@ def parse_accounts(text: str) -> List[Dict[str, Any]]:
                 try:
                     pct = float(m_5h.group(1))
                     current_acc["gemini_5h_pct"] = pct
+                    if m_5h.group(2):
+                        current_acc["gemini_5h_reset_sec"] = _parse_human_reset_to_seconds(m_5h.group(2))
                     if current_acc["quota"] == 1.0:
                         current_acc["quota"] = round(pct / 100.0, 4)
                 except ValueError:
@@ -205,6 +237,8 @@ def parse_accounts(text: str) -> List[Dict[str, Any]]:
                 try:
                     pct = float(m_w.group(1))
                     current_acc["gemini_weekly_pct"] = pct
+                    if m_w.group(2):
+                        current_acc["gemini_weekly_reset_sec"] = _parse_human_reset_to_seconds(m_w.group(2))
                     q5 = current_acc.get("gemini_5h_pct")
                     if q5 is not None:
                         current_acc["quota"] = round(min(q5, pct) / 100.0, 4)
@@ -552,9 +586,148 @@ def verify_round_robin(
     }
 
 
+WINDOW_5H_SECS = 18000.0   # 5 hours
+WINDOW_7D_SECS = 604800.0  # 7 days
+
+
+def _parse_iso_or_timestamp(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        val = val.strip()
+        if not val or val.upper() in ("N/A", "NONE", "NULL", "READY"):
+            return None
+        try:
+            return float(val)
+        except ValueError:
+            pass
+        try:
+            from datetime import datetime
+            clean = val.replace("Z", "+00:00")
+            return datetime.fromisoformat(clean).timestamp()
+        except Exception:
+            return None
+    return None
+
+
+def compute_capacity_state(account: Dict[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
+    """
+    Computes reset-aware capacity metrics for an account across 5-hour and 7-day quota windows.
+    Matches bin/agy-pool compute_capacity_state().
+    """
+    if now is None:
+        import time
+        now = time.time()
+
+    q = account.get("last_quota")
+    if not isinstance(q, dict):
+        q = {}
+
+    g5_dict = q.get("gemini_5h")
+    if isinstance(g5_dict, dict) and g5_dict.get("fraction") is not None:
+        raw_q5 = g5_dict.get("fraction")
+    elif q.get("remaining_fraction") is not None:
+        raw_q5 = q.get("remaining_fraction")
+    elif account.get("gemini_5h_pct") is not None:
+        raw_q5 = account.get("gemini_5h_pct") / 100.0
+    elif account.get("quota") is not None:
+        raw_q5 = account.get("quota")
+    else:
+        raw_q5 = 1.0
+
+    try:
+        q5 = max(0.0, min(1.0, float(raw_q5)))
+    except (ValueError, TypeError):
+        q5 = 1.0
+
+    gw_dict = q.get("gemini_weekly")
+    if isinstance(gw_dict, dict) and gw_dict.get("fraction") is not None:
+        raw_q7 = gw_dict.get("fraction")
+    elif account.get("gemini_weekly_pct") is not None:
+        raw_q7 = account.get("gemini_weekly_pct") / 100.0
+    elif account.get("weekly_quota") is not None:
+        raw_q7 = account.get("weekly_quota")
+    elif q.get("remaining_fraction") is not None:
+        raw_q7 = q.get("remaining_fraction")
+    elif account.get("quota") is not None:
+        raw_q7 = account.get("quota")
+    else:
+        raw_q7 = 1.0
+
+    try:
+        q7 = max(0.0, min(1.0, float(raw_q7)))
+    except (ValueError, TypeError):
+        q7 = 1.0
+
+    reset_val_5 = None
+    if isinstance(g5_dict, dict):
+        reset_val_5 = g5_dict.get("reset_time")
+    if reset_val_5 is None:
+        reset_val_5 = q.get("reset_time")
+    if reset_val_5 is None:
+        reset_val_5 = account.get("gemini_5h_reset")
+
+    reset_val_7 = None
+    if isinstance(gw_dict, dict):
+        reset_val_7 = gw_dict.get("reset_time")
+    if reset_val_7 is None:
+        reset_val_7 = account.get("gemini_weekly_reset")
+
+    if account.get("gemini_5h_reset_sec") is not None:
+        try:
+            t5 = float(account["gemini_5h_reset_sec"])
+            r5 = 1.0 if t5 <= 0 else min(1.0, t5 / WINDOW_5H_SECS)
+        except (ValueError, TypeError):
+            r5 = 1.0
+    else:
+        ts5 = _parse_iso_or_timestamp(reset_val_5)
+        if ts5 is None:
+            r5 = 1.0
+        else:
+            diff5 = ts5 - now
+            r5 = 1.0 if diff5 <= 0 else min(1.0, diff5 / WINDOW_5H_SECS)
+
+    if account.get("gemini_weekly_reset_sec") is not None:
+        try:
+            t7 = float(account["gemini_weekly_reset_sec"])
+            r7 = 1.0 if t7 <= 0 else min(1.0, t7 / WINDOW_7D_SECS)
+        except (ValueError, TypeError):
+            r7 = 1.0
+    else:
+        ts7 = _parse_iso_or_timestamp(reset_val_7)
+        if ts7 is None:
+            r7 = 1.0
+        else:
+            diff7 = ts7 - now
+            r7 = 1.0 if diff7 <= 0 else min(1.0, diff7 / WINDOW_7D_SECS)
+
+    pace5 = q5 - r5
+    pace7 = q7 - r7
+    worst_pace = min(pace5, pace7)
+    total_pace = pace5 + pace7
+    raw_floor = min(q5, q7)
+    is_depleted = (raw_floor <= 0.005)
+
+    return {
+        "q5": q5,
+        "q7": q7,
+        "r5": r5,
+        "r7": r7,
+        "pace5": pace5,
+        "pace7": pace7,
+        "worst_pace": worst_pace,
+        "total_pace": total_pace,
+        "raw_floor": raw_floor,
+        "is_depleted": is_depleted,
+    }
+
+
 def verify_least_used(
     dispatches: List[str],
-    accounts: List[Dict[str, Any]]
+    accounts: List[Dict[str, Any]],
+    now: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     Verify that dispatches followed least_used strategy (lowest hits first).
@@ -562,6 +735,10 @@ def verify_least_used(
     """
     if not dispatches:
         return {"passed": False, "reason": "No dispatches recorded in log delta"}
+
+    if now is None:
+        import time
+        now = time.time()
 
     eligible = [dict(a) for a in accounts if a.get("is_eligible", True)]
     if not eligible:
@@ -597,35 +774,48 @@ def verify_least_used(
             }
 
         # Check production tie-breaking among candidates with equal min hits:
-        # Sort by higher remaining quota, then stable account ID
+        # Sort by higher capacity pace / quota, then stable account ID
         min_accounts = [
             a for a in eligible if sim_hits[a.get("email") or a.get("id")] == min_hits_val
         ]
-        min_accounts.sort(
-            key=lambda a: (-round(a.get("quota", 1.0), 2), a.get("id", ""))
-        )
+        def _lu_tie_key(a):
+            cap = compute_capacity_state(a, now=now)
+            return (
+                -round(cap["worst_pace"], 2),
+                -round(cap["total_pace"], 2),
+                -round(cap["raw_floor"], 2),
+                a.get("id", "")
+            )
+        min_accounts.sort(key=_lu_tie_key)
         expected_top = min_accounts[0].get("email") or min_accounts[0].get("id")
 
         if d != expected_top and len(min_accounts) > 1:
-            expected_q = round(min_accounts[0].get("quota", 1.0), 2)
+            top_cap = compute_capacity_state(min_accounts[0], now=now)
             actual_acc = next((a for a in min_accounts if (a.get("email") == d or a.get("id") == d)), None)
-            actual_q = round(actual_acc.get("quota", 1.0), 2) if actual_acc else 0.0
-            if actual_q < expected_q:
+            actual_cap = compute_capacity_state(actual_acc, now=now) if actual_acc else None
+
+            if actual_acc and _lu_tie_key(actual_acc) == _lu_tie_key(min_accounts[0]):
+                pass
+            elif actual_cap and (
+                (round(actual_cap["worst_pace"], 2) < round(top_cap["worst_pace"], 2)) or
+                (round(actual_cap["total_pace"], 2) < round(top_cap["total_pace"], 2)) or
+                (round(actual_cap["raw_floor"], 2) < round(top_cap["raw_floor"], 2))
+            ):
                 return {
                     "passed": False,
                     "reason": (
                         f"Step {idx}: tie-breaker failed. Both had {min_hits_val} hits, but '{expected_top}' "
-                        f"had higher quota ({expected_q}) than '{d}' ({actual_q})"
+                        f"had higher quota ({round(top_cap['raw_floor'], 2)}) than '{d}' ({round(actual_cap['raw_floor'], 2)})"
                     ),
                     "step": idx,
                     "expected": expected_top,
                     "actual": d,
                 }
-            elif actual_acc and (actual_acc.get("id", "") != min_accounts[0].get("id", "")) and actual_q == expected_q:
+            elif actual_acc and (actual_acc.get("id", "") != min_accounts[0].get("id", "")):
                 return {
                     "passed": False,
                     "reason": (
-                        f"Step {idx}: tie-breaker failed. Equal hits ({min_hits_val}) and equal quota ({actual_q}), "
+                        f"Step {idx}: tie-breaker failed. Equal hits ({min_hits_val}) and equal quota ({round(top_cap['raw_floor'], 2)}), "
                         f"expected ID '{min_accounts[0].get('id')}' ('{expected_top}'), got '{actual_acc.get('id')}' ('{d}')"
                     ),
                     "step": idx,
@@ -645,34 +835,60 @@ def verify_least_used(
 
 def verify_max_quota(
     dispatches: List[str],
-    accounts: List[Dict[str, Any]]
+    accounts: List[Dict[str, Any]],
+    now: Optional[float] = None
 ) -> Dict[str, Any]:
     """
-    Verify that dispatches followed max_quota strategy (highest remaining quota first).
+    Verify that dispatches followed max_quota strategy (reset-aware capacity scheduling).
     """
     if not dispatches:
         return {"passed": False, "reason": "No dispatches recorded in log delta"}
+
+    if now is None:
+        import time
+        now = time.time()
 
     eligible = [a for a in accounts if a.get("is_eligible", True)]
     if not eligible:
         return {"passed": False, "reason": "No eligible accounts available for max_quota"}
 
-    # Sort eligible by quota desc, hits asc
+    def _mq_key(a):
+        cap = compute_capacity_state(a, now=now)
+        hits = a.get("hits", a.get("gen_count", a.get("request_count", 0)))
+        return (
+            round(cap["worst_pace"], 2),
+            -hits,
+            round(cap["total_pace"], 2),
+            round(cap["raw_floor"], 2)
+        )
+
+    # Sort eligible by capacity pace desc, raw floor desc, hits asc
     sorted_eligible = sorted(
         eligible,
-        key=lambda a: (round(a.get("quota", 1.0), 2), -a.get("hits", 0)),
+        key=_mq_key,
         reverse=True
     )
     top_account = sorted_eligible[0].get("email") or sorted_eligible[0].get("id")
+    top_key = _mq_key(sorted_eligible[0])
+
+    top_tied = {
+        a.get("email") or a.get("id")
+        for a in sorted_eligible
+        if _mq_key(a) == top_key
+    }
 
     # In max_quota without cooldown/failover, dispatches should go to top candidate
     for idx, d in enumerate(dispatches):
-        if d != top_account:
+        if d != top_account and d not in top_tied:
+            top_cap = compute_capacity_state(sorted_eligible[0], now=now)
+            actual_acc = next((a for a in eligible if a.get("email") == d or a.get("id") == d), None)
+            actual_cap = compute_capacity_state(actual_acc, now=now) if actual_acc else None
+            actual_str = f"worst_pace: {round(actual_cap['worst_pace'], 2)}, quota: {actual_cap['raw_floor']}" if actual_cap else "unknown"
             return {
                 "passed": False,
                 "reason": (
                     f"Step {idx}: expected highest-quota candidate '{top_account}' "
-                    f"(quota: {sorted_eligible[0].get('quota')}), but got '{d}'"
+                    f"(worst_pace: {round(top_cap['worst_pace'], 2)}, quota: {sorted_eligible[0].get('quota', top_cap['raw_floor'])}), but got '{d}' ({actual_str})"
                 ),
                 "step": idx,
                 "expected": top_account,
