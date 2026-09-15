@@ -23,12 +23,13 @@ rm -f "$TARGET_DIR/agy-pool" "$TARGET_DIR/agy-raw" "$TARGET_DIR/agy-orig"
 rm -f "$HOME/.local/bin/agy-pool" "$HOME/.local/bin/agy-raw" "$HOME/.local/bin/agy-orig" 2>/dev/null || true
 echo -e "\033[32m[✓] Removed agy-pool binaries and symlinks\033[0m"
 
-# 3. Clean ~/.bashrc
-BASHRC="$HOME/.bashrc"
-if [ -f "$BASHRC" ]; then
-    sed -i '/# >>> agy-pool integration >>>/,/# <<< agy-pool integration <<</d' "$BASHRC"
-    echo -e "\033[32m[✓] Cleaned agy-pool alias from $BASHRC\033[0m"
-fi
+# 3. Clean shell rc files
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    if [ -f "$rc" ]; then
+        sed -i '/# >>> agy-pool integration >>>/,/# <<< agy-pool integration <<</d' "$rc"
+        echo -e "\033[32m[✓] Cleaned agy-pool alias from $rc\033[0m"
+    fi
+done
 
 echo -e "\033[1;32mUninstallation complete.\033[0m"
 echo -e "(Your account tokens in ~/.gemini/agy-pool-accounts.json were preserved. Delete manually if desired.)"

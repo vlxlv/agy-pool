@@ -1,6 +1,6 @@
 # agy-pool: Antigravity Multi-Account Quota Pool & Intelligent Load Balancer Suite
 
-[![Version](https://img.shields.io/badge/version-0.1.0--alpha8-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.0--alpha9-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green.svg)](#)
 [![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](#)
@@ -18,8 +18,9 @@ A zero-dependency multi-account quota pool and local reverse proxy for **Antigra
 ## Key Capabilities
 
 - **Zero External Dependencies**: Built 100% on the Python 3 standard library (`urllib`, `http.server`, `sqlite3`, `fcntl`, `hashlib`, `hmac`). Runs instantly on any Termux or Linux system with no `pip` or wheel compilation.
-- **Intelligent Load Balancing & Fast Failover**: Dynamically routes CLI generation requests based on cached model quotas. Automatically fails over in-flight requests (<100ms) upon hitting HTTP 429 or quota exhaustion, dynamically promoting healthy accounts.
+- **Intelligent Load Balancing & Fast Failover**: Dynamically routes CLI generation requests based on configurable strategies (`max_quota`, `least_used`, `round_robin`). Automatically fails over in-flight requests (<100ms) upon hitting HTTP 429 or quota exhaustion, dynamically respecting upstream `Retry-After` headers.
 - **Automated Hot-Reload & Self-Healing Daemon**: Tracks in-memory daemon bytecode version and script mtime, seamlessly hot-reloading background proxy instances (~0.5s) upon disk code updates or CLI invocations to prevent stale metric drift.
+- **Built-in System Diagnostics (`agy-pool doctor`)**: Instant self-test verifying runtime environment, native binary detection, daemon status, pool integrity, and live Google Cloud Code TLS connectivity.
 - **Cross-Device Migration & Encrypted Backup**: Easily backup and restore entire account pools across Termux, VPS, or desktop machines via `export` and `import`. Supports tamper-proof passphrase encryption (PBKDF2-HMAC-SHA256 + CTR keystream), automatic deduplication/merging, and Unix pipe streaming (`-`).
 - **Account-Agnostic Session Continuity (`agy -c`)**: Automatically queries `conversation_summaries.db` to identify the most recent session for the current workspace directory, allowing seamless workflow resumption across different accounts.
 - **Security Isolation & Self-Healing**: Detects Google Cloud Code verification challenges (`VALIDATION_REQUIRED` / 403) and token revocations, isolates restricted accounts to prevent quota deadlocks, and provides one-click browser verification (`agy-pool verify`).
@@ -44,7 +45,7 @@ git clone https://github.com/midori01/agy-pool.git ~/agy-pool
 cd ~/agy-pool && bash install.sh
 ```
 
-The installer automatically validates the Python 3 runtime, installs global symlinks (`agy-pool`, `agy-raw`, `agy-orig`), configures shell aliases, and imports existing Antigravity credentials as Account #1.
+The installer automatically validates the Python 3 runtime, installs global symlinks (`agy-pool`, `agy-raw`, `agy-orig`), configures shell aliases (for both Bash and Zsh), and imports existing Antigravity credentials as Account #1.
 
 ---
 
@@ -69,12 +70,17 @@ The installer automatically validates the Python 3 runtime, installs global syml
 | :--- | :--- | :--- |
 | `agy-pool status` | - | Display gateway daemon status, active account, and cached quotas |
 | `agy-pool quota` | `agy-pool list` | Refresh and display quota progress bars, reset countdowns, and hits |
+| `agy-pool strategy [name]` | `strat` | View or switch load balancing strategy (`max_quota`, `least_used`, `round_robin`) |
+| `agy-pool doctor` | `check`, `health` | Run end-to-end system, network, and account diagnostic suite |
+| `agy-pool rename <ID>` | e.g. `rename 1 "Work"` | Assign a custom friendly name or label to an account |
 | `agy-pool login` | - | Authenticate and add a new Google account via system browser |
 | `agy-pool import-current` | - | Import current active `~/.gemini/` credentials into the pool |
 | `agy-pool switch auto` | - | Switch active account to the one with highest available quota |
 | `agy-pool switch <ID/Email>` | e.g. `switch 2` | Manually designate active account |
 | `agy-pool verify [ID/Email]` | e.g. `verify 3` | Open Google Cloud Code security verification flow in browser |
 | `agy-pool remove <ID/Email>` | e.g. `remove 2` | Remove account from pool |
+
+> **Note on targeting**: Numeric index targeting (e.g. `rename 1 "Work"`, `switch 2`, `remove 2`) is provided for interactive CLI convenience, but index numbers may shift after account removal, import, or replacement. For automated scripts and workflows, always prefer using the stable account ID or exact email address.
 
 ```text
 ====================================================================
@@ -141,7 +147,10 @@ ssh phone1 agy-pool export - | agy-pool import -
 
 ## FAQ & Diagnostics
 
-### Q1: How do I verify whether my session is routed through the gateway?
+### Q1: How do I customize the proxy gateway port?
+Set the `AGY_PORT` environment variable (e.g. `export AGY_PORT=9000`). The gateway defaults to `8899` and strictly validates port numbers between `1` and `65535`.
+
+### Q2: How do I verify whether my session is routed through the gateway?
 - **Live Logs**: Run `agy-pool log -f` in another tab to observe real-time proxy dispatch.
 - **Hits Counter**: Run `agy-pool status` before and after a prompt to see the request counter increment.
 - **Process Environment**: Inspect `CLOUD_CODE_URL`:

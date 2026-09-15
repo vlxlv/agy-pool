@@ -5,6 +5,30 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha9] - 2026-09-15
+
+### Added
+- **Universal Portability & Multi-Shell Integration**:
+  - Replaced Termux-specific shebangs (`/data/data/com.termux/...`) in `bin/agy-pool` and `bin/agy-raw` with POSIX-standard `#!/usr/bin/env` for out-of-the-box execution across Linux, macOS, WSL, and BSD.
+  - Enhanced `install.sh` and `uninstall.sh` to automatically detect and configure aliases in Zsh (`~/.zshrc`) alongside Bash (`~/.bashrc`).
+- **Dynamic HTTP 429 `Retry-After` Header Parsing**:
+  - Automatically extracts and respects upstream `Retry-After` headers (both integer seconds and RFC HTTP dates) when accounts hit rate limits, replacing the static 300s penalty and preventing excessive lockouts on brief throttles.
+- **Configurable Multi-Strategy Load Balancing Engine (`strategy`)**:
+  - Implemented dynamic request routing strategies:
+    - `max_quota` (default): Prioritizes accounts with highest remaining quota, breaking ties with lowest AI generation count (`Hits`).
+    - `least_used`: Distributes inference generations evenly across healthy accounts by prioritizing lowest generation count (`gen_count`).
+    - `round_robin`: Cycles sequentially among healthy pool accounts using least-recently-used timestamps.
+  - Added dedicated `agy-pool strategy [name]` CLI command to inspect and update load-balancing policies.
+- **Built-in System Diagnostics (`agy-pool doctor`)**:
+  - Added comprehensive `agy-pool doctor` CLI command (with fast dispatch) checking Python runtime, native `agy` binary detection and version, gateway daemon state, pool token validity, SQLite database accessibility, and TLS connectivity to Google Cloud Code (`daily-cloudcode-pa.googleapis.com:443`).
+- **Account Renaming & Custom Aliases (`agy-pool rename`)**:
+  - Added `agy-pool rename <ID/Email> <Name>` to allow designating friendly labels (e.g. "Work", "Personal", "Backup") in quota dashboards.
+- **Configurable Port via `AGY_PORT`**:
+  - Allows overriding default port `8899` via the `AGY_PORT` environment variable to prevent local port collisions.
+- **Session Continuity Path Unquoting (`-c`)**:
+  - Added URL unquoting in `find_latest_conversation_for_dir` to ensure workspaces containing spaces or special characters match SQLite records seamlessly.
+  - Supported `--conversation=...` syntax in `resolve_continue_arg`.
+
 ## [0.1.0-alpha8] - 2026-09-15
 
 ### Added

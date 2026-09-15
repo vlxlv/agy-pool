@@ -51,13 +51,21 @@ ln -sf "$RAW_SRC" "$TARGET_DIR/agy-raw"
 ln -sf "$RAW_SRC" "$TARGET_DIR/agy-orig"
 echo -e "\033[32m[✓] Installed executables: agy-pool, agy-raw, agy-orig in $TARGET_DIR\033[0m"
 
-# 4. Configure ~/.bashrc aliases
-BASHRC="$HOME/.bashrc"
-touch "$BASHRC"
+# 4. Configure shell aliases (~/.bashrc and ~/.zshrc)
+SHELL_FILES=()
+[ -f "$HOME/.bashrc" ] && SHELL_FILES+=("$HOME/.bashrc")
+[ -f "$HOME/.zshrc" ] && SHELL_FILES+=("$HOME/.zshrc")
+
+# If neither file exists, default to creating ~/.bashrc (preserves existing installer behavior)
+if [ ${#SHELL_FILES[@]} -eq 0 ]; then
+    SHELL_FILES=("$HOME/.bashrc")
+fi
 
 MARKER="# >>> agy-pool integration >>>"
-if ! grep -Fq "$MARKER" "$BASHRC"; then
-    cat >> "$BASHRC" << 'EOF'
+for rc in "${SHELL_FILES[@]}"; do
+    touch "$rc"
+    if ! grep -Fq "$MARKER" "$rc"; then
+        cat >> "$rc" << 'EOF'
 
 # >>> agy-pool integration >>>
 alias agy='agy-pool run'
@@ -65,8 +73,9 @@ alias agy-raw='agy-raw'
 alias agy-orig='agy-raw'
 # <<< agy-pool integration <<<
 EOF
-    echo -e "\033[32m[✓] Added 'alias agy=agy-pool run' and 'agy-raw / agy-orig' to $BASHRC\033[0m"
-fi
+        echo -e "\033[32m[✓] Added 'alias agy=agy-pool run' and 'agy-raw / agy-orig' to $rc\033[0m"
+    fi
+done
 
 # 5. Auto-import current antigravity credentials if present
 echo -e "\033[36m[*] Checking for existing Antigravity login token...\033[0m"

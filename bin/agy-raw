@@ -1,6 +1,11 @@
-#!/data/data/com.termux/files/usr/bin/env bash
+#!/usr/bin/env bash
 # agy-raw: Directly execute original native Antigravity CLI without proxy gateway
-unset CLOUD_CODE_URL
+PORT="${AGY_PORT:-8899}"
+case "${CLOUD_CODE_URL:-}" in
+    "http://127.0.0.1:${PORT}"|"http://127.0.0.1:${PORT}/"|"http://localhost:${PORT}"|"http://localhost:${PORT}/")
+        unset CLOUD_CODE_URL
+        ;;
+esac
 
 SELF="$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
 

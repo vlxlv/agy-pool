@@ -16,6 +16,8 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
+from datetime import datetime, timezone
 from unittest import mock
 
 
@@ -915,7 +917,385 @@ class AgyPoolTest(unittest.TestCase):
             agy_pool.main()
         self.assertIn(f"agy-pool {agy_pool.VERSION}", buf.getvalue())
 
+    def test_parse_retry_after(self):
+        # Integer seconds
+        self.assertEqual(agy_pool._parse_retry_after({"Retry-After": "45"}), 45)
+        # Min clamp (5s)
+        self.assertEqual(agy_pool._parse_retry_after({"Retry-After": "1"}), 5)
+        # Max clamp (86400s)
+        self.assertEqual(agy_pool._parse_retry_after({"Retry-After": "999999"}), 86400)
+        # Invalid / missing -> default
+        self.assertEqual(agy_pool._parse_retry_after({}), 300)
+        self.assertEqual(agy_pool._parse_retry_after({"Retry-After": "invalid"}), 300)
+
+        # HTTP-date format (RFC 2822 / RFC 7231)
+        future_dt = datetime.now(timezone.utc)
+        date_str = email.utils.format_datetime(future_dt)
+        parsed = agy_pool._parse_retry_after({"Retry-After": date_str})
+        self.assertGreaterEqual(parsed, 5)
+
+    def test_429_retry_after_cooldown_duration(self):
+        self.save_accounts([account("a"), account("b")])
+        scenario = Scenario({
+            "token-a": [(429, b'{"error":{"status":"RESOURCE_EXHAUSTED"}}', {"Retry-After": "60"})],
+            "token-b": [(200, b"from-b", {})],
+        })
+        proxy = self.start_proxy(scenario)
+        now_before = time.time()
+        status, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual((status, body), (200, b"from-b"))
+        pool = agy_pool.load_pool()
+        acc_a = next(a for a in pool["accounts"] if a["id"] == "a")
+        self.assertGreaterEqual(acc_a["rate_limited_until"], now_before + 55)
+        self.assertLessEqual(acc_a["rate_limited_until"], now_before + 65)
+
+    def test_strategy_least_used_and_round_robin_selection(self):
+        acc1 = account("a")
+        acc1["gen_count"] = 10
+        acc1["last_used_at"] = 1000
+        acc1["last_quota"] = {"remaining_fraction": 1.0}
+
+        acc2 = account("b")
+        acc2["gen_count"] = 2
+        acc2["last_used_at"] = 2000
+        acc2["last_quota"] = {"remaining_fraction": 0.5}
+
+        # 1. least_used strategy: b has gen_count=2, a has 10 -> b selected first despite lower quota
+        self.save_accounts([acc1, acc2])
+        agy_pool.pool_transaction(lambda p: p.update(strategy="least_used"))
+        scenario = Scenario({"token-b": [(200, b"ok-b", {})]})
+        proxy = self.start_proxy(scenario)
+        status, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual((status, body), (200, b"ok-b"))
+        self.assertEqual(scenario.calls[0][0], "token-b")
+
+        # 2. round_robin strategy: a has last_used_at=1000 (older), b has 2000 -> a selected first
+        self.save_accounts([acc1, acc2])
+        agy_pool.pool_transaction(lambda p: p.update(strategy="round_robin"))
+        scenario2 = Scenario({"token-a": [(200, b"ok-a", {})]})
+        proxy2 = self.start_proxy(scenario2)
+        status, body, _ = self.request(proxy2, "/v1internal:streamGenerateContent")
+        self.assertEqual((status, body), (200, b"ok-a"))
+        self.assertEqual(scenario2.calls[0][0], "token-a")
+
+    def test_manage_strategy_cli_and_validation(self):
+        self.save_accounts([account("a")])
+        self.assertEqual(agy_pool.load_pool().get("strategy"), "max_quota")
+
+        # Update to least_used
+        self.assertTrue(agy_pool.manage_strategy("least_used"))
+        self.assertEqual(agy_pool.load_pool().get("strategy"), "least_used")
+
+        # Update to round_robin
+        self.assertTrue(agy_pool.manage_strategy("round_robin"))
+        self.assertEqual(agy_pool.load_pool().get("strategy"), "round_robin")
+
+        # Reject invalid strategy
+        self.assertFalse(agy_pool.manage_strategy("nonexistent"))
+        self.assertEqual(agy_pool.load_pool().get("strategy"), "round_robin")
+
+        # Query strategy without args returns current
+        self.assertEqual(agy_pool.manage_strategy(), "round_robin")
+
+    def test_rename_account(self):
+        acc = account("a")
+        acc["name"] = "OldName"
+        self.save_accounts([acc])
+
+        # Rename by index
+        self.assertTrue(agy_pool.rename_account("1", "Primary Work"))
+        self.assertEqual(agy_pool.load_pool()["accounts"][0]["name"], "Primary Work")
+
+        # Rename by id
+        self.assertTrue(agy_pool.rename_account("a", "Personal"))
+        self.assertEqual(agy_pool.load_pool()["accounts"][0]["name"], "Personal")
+
+        # Non-existent account
+        self.assertFalse(agy_pool.rename_account("acc_999", "Test"))
+        # Empty name
+        self.assertFalse(agy_pool.rename_account("a", "   "))
+
+    def test_doctor_command_execution(self):
+        acc = account("a")
+        self.save_accounts([acc])
+        buf = io.StringIO()
+        fake_sock = mock.MagicMock()
+        with mock.patch("sys.stdout", buf), \
+             mock.patch("socket.create_connection", return_value=fake_sock), \
+             mock.patch("ssl.create_default_context"):
+            res = agy_pool.run_doctor()
+        out = buf.getvalue()
+        self.assertIn("Antigravity System Doctor", out)
+        self.assertIn("Python Runtime", out)
+        self.assertIn("Account Pool: 1 account(s)", out)
+
+    def test_conversation_unquoting_with_spaces(self):
+        workspace = os.path.join(self.temp.name, "my workspace", "sub project")
+        os.makedirs(workspace)
+        db_dir = os.path.join(self.temp.name, ".gemini", "antigravity-cli")
+        os.makedirs(db_dir, exist_ok=True)
+        db = os.path.join(db_dir, "conversation_summaries.db")
+        with sqlite3.connect(db) as connection:
+            connection.execute("CREATE TABLE conversation_summaries (conversation_id, title, workspace_uris, last_modified_time)")
+            uri = "file://" + urllib.parse.quote(workspace)
+            connection.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?, ?)",
+                               ("space-cid", "Space Title", json.dumps([uri]), 10))
+        connection.close()
+        cid, title, matched = agy_pool.find_latest_conversation_for_dir(workspace)
+        self.assertEqual(cid, "space-cid")
+        self.assertEqual(title, "Space Title")
+        self.assertEqual(matched, os.path.realpath(workspace))
+
+    def test_resolve_continue_arg_with_equals_syntax(self):
+        args = ["--conversation=custom-cid", "-c"]
+        resolved = agy_pool.resolve_continue_arg(args)
+        self.assertEqual(resolved, args)
+
+    def test_resolve_gateway_port(self):
+        # Default
+        self.assertEqual(agy_pool.resolve_gateway_port(), 8899)
+        self.assertEqual(agy_pool.resolve_gateway_port(""), 8899)
+        self.assertEqual(agy_pool.resolve_gateway_port(None), 8899)
+
+        # Valid override
+        self.assertEqual(agy_pool.resolve_gateway_port("9000"), 9000)
+        self.assertEqual(agy_pool.resolve_gateway_port(8080), 8080)
+        self.assertEqual(agy_pool.resolve_gateway_port(1), 1)
+        self.assertEqual(agy_pool.resolve_gateway_port(65535), 65535)
+
+        # Env var override
+        with mock.patch.dict(os.environ, {"AGY_PORT": "9999"}):
+            self.assertEqual(agy_pool.resolve_gateway_port(), 9999)
+
+        # Invalid strings
+        with self.assertRaises(ValueError):
+            agy_pool.resolve_gateway_port("abc")
+        with self.assertRaises(ValueError):
+            agy_pool.resolve_gateway_port("8899-invalid")
+
+        # Range violations
+        with self.assertRaises(ValueError):
+            agy_pool.resolve_gateway_port(0)
+        with self.assertRaises(ValueError):
+            agy_pool.resolve_gateway_port("0")
+        with self.assertRaises(ValueError):
+            agy_pool.resolve_gateway_port(-1)
+        with self.assertRaises(ValueError):
+            agy_pool.resolve_gateway_port(65536)
+        with self.assertRaises(ValueError):
+            agy_pool.resolve_gateway_port("70000")
+
+    def test_round_robin_rotation_and_cursor_advancement(self):
+        acc1 = account("a")
+        acc2 = account("b")
+        acc3 = account("c")
+        self.save_accounts([acc1, acc2, acc3])
+        agy_pool.pool_transaction(lambda p: p.update(strategy="round_robin"))
+
+        # Candidate order does not advance cursor
+        pool = agy_pool.load_pool()
+        ordered = agy_pool.order_candidates(pool["accounts"], strategy="round_robin", pool=pool)
+        self.assertEqual([a["id"] for a in ordered], ["a", "b", "c"])
+        self.assertIsNone(agy_pool.load_pool().get("round_robin_last_account_id"))
+
+        # Request 1 dispatches to A
+        scenario = Scenario({
+            "token-a": [(200, b"res-a", {}), (200, b"res-a", {}), (200, b"res-a", {})],
+            "token-b": [(200, b"res-b", {})],
+            "token-c": [(200, b"res-c", {}), (200, b"res-c", {})],
+            "token-d": [(200, b"res-d", {})],
+        })
+        proxy = self.start_proxy(scenario)
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(body, b"res-a")
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "a")
+
+        # Request 2 dispatches to B
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(body, b"res-b")
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "b")
+
+        # Request 3 dispatches to C
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(body, b"res-c")
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "c")
+
+        # Request 4 wraps around to A
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(body, b"res-a")
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "a")
+
+        # Put account B in cooldown; next request should skip B and dispatch to C
+        agy_pool.pool_transaction(lambda p: [a.update(rate_limited_until=time.time() + 300) for a in p["accounts"] if a["id"] == "b"])
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(body, b"res-c")
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "c")
+
+        # Delete account C; cursor was on C; fallback cleanly picks next available (A)
+        agy_pool.pool_transaction(lambda p: p.update(accounts=[a for a in p["accounts"] if a["id"] != "c"]))
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(body, b"res-a")
+
+        # Add account D; it joins rotation
+        acc4 = account("d")
+        agy_pool.pool_transaction(lambda p: p["accounts"].append(acc4))
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(body, b"res-d")
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "d")
+
+    def test_retry_after_account_isolation(self):
+        acc1 = account("a")
+        acc2 = account("b")
+        self.save_accounts([acc1, acc2])
+
+        # Acc1 returns 429 with Retry-After: 60, failover to Acc2 succeeds
+        scenario = Scenario({
+            "token-a": [(429, b"ResourceExhausted", {"Retry-After": "60"})],
+            "token-b": [(200, b"ok-b", {})],
+        })
+        proxy = self.start_proxy(scenario)
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(body, b"ok-b")
+
+        pool = agy_pool.load_pool()
+        a = next(x for x in pool["accounts"] if x["id"] == "a")
+        b = next(x for x in pool["accounts"] if x["id"] == "b")
+
+        # Acc1 is throttled
+        self.assertGreater(a.get("rate_limited_until", 0), time.time() + 40)
+        # Acc2 is untouched and NOT throttled
+        self.assertIsNone(b.get("rate_limited_until"))
+        self.assertEqual(b.get("gen_count", 0), 1)
+
+    def test_doctor_diagnostics_and_exit_policy(self):
+        acc = account("a")
+        self.save_accounts([acc])
+
+        fake_sock = mock.MagicMock()
+
+        # 1. Normal run with warnings (e.g. missing native binary in temp test dir) -> returns True
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), \
+             mock.patch("socket.create_connection", return_value=fake_sock), \
+             mock.patch("ssl.create_default_context"), \
+             mock.patch.object(agy_pool, "refresh_token") as mock_refresh:
+            res = agy_pool.run_doctor()
+            self.assertTrue(res)
+            # Verify read-only: no token refresh calls
+            mock_refresh.assert_not_called()
+
+        # 2. Fatal failure: mock Python version < 3.8 -> returns False (exit 1)
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), \
+             mock.patch("socket.create_connection", return_value=fake_sock), \
+             mock.patch("ssl.create_default_context"), \
+             mock.patch("sys.version_info", (3, 7, 0)):
+            res = agy_pool.run_doctor()
+            self.assertFalse(res)
+        self.assertIn("Python 3.8+ required", buf.getvalue())
+
+        # 3. Upstream TLS/network failure -> produces WARN and returns True (exit 0)
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), \
+             mock.patch("socket.create_connection", side_effect=OSError("Network unreachable")), \
+             mock.patch.object(agy_pool, "refresh_token") as mock_refresh:
+            res = agy_pool.run_doctor()
+            self.assertTrue(res)
+            mock_refresh.assert_not_called()
+        self.assertIn(f"Cloud Code API: Connection to {agy_pool.BACKEND_HOST} failed", buf.getvalue())
+        self.assertIn("warning(s)", buf.getvalue())
+
+        # 4. Missing or corrupted pool file -> returns False
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), \
+             mock.patch("socket.create_connection", return_value=fake_sock), \
+             mock.patch("ssl.create_default_context"), \
+             mock.patch.object(agy_pool, "load_pool", side_effect=ValueError("corrupted JSON")):
+            res = agy_pool.run_doctor()
+            self.assertFalse(res)
+        self.assertIn("Failed to read pool file", buf.getvalue())
+
+    def test_max_quota_fallback_preserves_raw_order(self):
+        now = time.time()
+        cd1 = account("cd_later")
+        cd1["rate_limited_until"] = now + 500
+        cd2 = account("cd_sooner")
+        cd2["rate_limited_until"] = now + 10
+
+        res1 = account("z_restricted")
+        res1["status"] = "validation_required"
+        res2 = account("a_restricted")
+        res2["status"] = "auth_error"
+
+        # Under max_quota, fallback ordering must preserve exact input order (pre-alpha9 stable sort)
+        ordered = agy_pool.order_candidates([cd1, cd2, res1, res2], strategy="max_quota", now=now)
+        self.assertEqual([a["id"] for a in ordered], ["cd_later", "cd_sooner", "z_restricted", "a_restricted"])
+
+    def test_strategy_legacy_pool_and_tie_breaking(self):
+        # Legacy pool missing "strategy" field
+        self.save_accounts([account("a")])
+        agy_pool.pool_transaction(lambda p: p.pop("strategy", None))
+        pool = agy_pool.load_pool()
+        self.assertNotIn("strategy", pool)
+
+        # Default query returns max_quota
+        self.assertEqual(agy_pool.manage_strategy(), "max_quota")
+
+        # order_candidates defaults to max_quota
+        acc1 = account("a")
+        acc1["last_quota"] = {"remaining_fraction": 0.5}
+        acc2 = account("b")
+        acc2["last_quota"] = {"remaining_fraction": 0.9}
+        ordered = agy_pool.order_candidates([acc1, acc2], pool=pool)
+        self.assertEqual([x["id"] for x in ordered], ["b", "a"])
+
+        # least_used tie-breaking: equal hits -> highest quota first -> stable ID
+        acc1 = account("a")
+        acc1["gen_count"] = 5
+        acc1["last_quota"] = {"remaining_fraction": 0.50}
+        acc2 = account("b")
+        acc2["gen_count"] = 5
+        acc2["last_quota"] = {"remaining_fraction": 0.80}
+        acc3 = account("c")
+        acc3["gen_count"] = 5
+        acc3["last_quota"] = {"remaining_fraction": 0.80}
+
+        ordered_lu = agy_pool.order_candidates([acc1, acc2, acc3], strategy="least_used")
+        # acc2 and acc3 have higher quota (0.80) than acc1 (0.50). Between acc2 and acc3, 'b' < 'c'
+        self.assertEqual([x["id"] for x in ordered_lu], ["b", "c", "a"])
+
+    def test_conversation_unquoting_additional_characters(self):
+        # Test directory with '+' (%2B) and '#' (%23) and spaces
+        workspace = os.path.join(self.temp.name, "c++ project #1", "src")
+        os.makedirs(workspace)
+        db_dir = os.path.join(self.temp.name, ".gemini", "antigravity-cli")
+        os.makedirs(db_dir, exist_ok=True)
+        db = os.path.join(db_dir, "conversation_summaries.db")
+        with sqlite3.connect(db) as connection:
+            connection.execute("CREATE TABLE conversation_summaries (conversation_id, title, workspace_uris, last_modified_time)")
+            uri = "file://" + urllib.parse.quote(workspace)
+            connection.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?, ?)",
+                               ("special-cid", "Special Chars Title", json.dumps([uri]), 100))
+        connection.close()
+        cid, title, matched = agy_pool.find_latest_conversation_for_dir(workspace)
+        self.assertEqual(cid, "special-cid")
+        self.assertEqual(title, "Special Chars Title")
+        self.assertEqual(matched, os.path.realpath(workspace))
+
+    def test_cli_exit_codes_on_subcommand_errors(self):
+        self.save_accounts([account("a")])
+        # Invalid strategy via sys.argv mock to main()
+        with mock.patch("sys.argv", ["agy-pool", "strategy", "invalid_strat"]), \
+             self.assertRaises(SystemExit) as cm:
+            agy_pool.main()
+        self.assertEqual(cm.exception.code, 1)
+
+        # Rename failure (empty name)
+        with mock.patch("sys.argv", ["agy-pool", "rename", "a", "   "]), \
+             self.assertRaises(SystemExit) as cm:
+            agy_pool.main()
+        self.assertEqual(cm.exception.code, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
-
