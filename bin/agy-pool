@@ -452,27 +452,92 @@ def _parse_retry_after(headers, default=300):
     return default
 
 
+def _quota_fraction(value):
+    """Return a bounded quota fraction, or None when the value is unknown/invalid."""
+    try:
+        value = float(value)
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        return max(0.0, min(1.0, value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _cached_quota_state(last_quota):
+    """Copy known cached windows without manufacturing unknown capacity."""
+    old = last_quota if isinstance(last_quota, dict) else {}
+    result = {}
+    for key in ("gemini_5h", "gemini_weekly", "third_party_5h", "third_party_weekly"):
+        window = old.get(key)
+        fraction = _quota_fraction(window.get("fraction")) if isinstance(window, dict) else None
+        if fraction is not None:
+            result[key] = {"fraction": fraction, "reset_time": window.get("reset_time")}
+
+    # Legacy pools stored only the combined fraction. Preserve their old usable
+    # scheduling behavior when a later refresh supplies just one explicit window.
+    if "gemini_5h" not in result and "gemini_weekly" not in result:
+        legacy = _quota_fraction(old.get("remaining_fraction"))
+        if legacy is not None:
+            reset = old.get("reset_time")
+            result["gemini_5h"] = {"fraction": legacy, "reset_time": reset}
+            result["gemini_weekly"] = {"fraction": legacy, "reset_time": reset}
+    return result
+
+
+def _recompute_compat_quota(quota_data):
+    """Derive legacy fields from known Gemini windows only."""
+    known = []
+    for key in ("gemini_5h", "gemini_weekly"):
+        window = quota_data.get(key)
+        fraction = _quota_fraction(window.get("fraction")) if isinstance(window, dict) else None
+        if fraction is not None:
+            window["fraction"] = fraction
+            known.append((fraction, window.get("reset_time")))
+    if known:
+        fraction, reset = min(known, key=lambda item: item[0])
+        quota_data["remaining_fraction"] = fraction
+        quota_data["reset_time"] = reset
+    else:
+        quota_data.pop("remaining_fraction", None)
+        quota_data.pop("reset_time", None)
+
+
+def _fetch_available_models_quota(headers, quota_data):
+    req = urllib.request.Request(
+        f"{BACKEND_URL_BASE}/v1internal:fetchAvailableModels",
+        data=b"{}",
+        headers=headers,
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        res = json.loads(resp.read().decode())
+    models = res.get("models", {})
+    default_model = res.get("defaultAgentModelId")
+    candidates = ([default_model] if default_model else []) + [
+        "gemini-3.8-flash-high", "gemini-3.6-flash-high", "gemini-3.5-flash-medium"
+    ]
+    candidates += [name for name in models if name not in candidates]
+    for name in candidates:
+        model = models.get(name)
+        qinfo = model.get("quotaInfo") if isinstance(model, dict) else None
+        fraction = _quota_fraction(qinfo.get("remainingFraction")) if isinstance(qinfo, dict) else None
+        if fraction is not None:
+            quota_data["gemini_5h"] = {"fraction": fraction, "reset_time": qinfo.get("resetTime")}
+            return
+    raise ValueError("model response contained no quota information")
+
+
 def query_quota(account):
-    """Refresh cached 5h and weekly quota from Google CloudCode PA API."""
+    """Refresh cached quota, preserving known windows absent from a partial response."""
     at = refresh_token(account)
     headers = {
         "Authorization": f"Bearer {at}",
         "Content-Type": "application/json",
         "User-Agent": DEFAULT_UA
     }
-
-    quota_data = {
-        "gemini_5h": {"fraction": 1.0, "reset_time": None},
-        "gemini_weekly": {"fraction": 1.0, "reset_time": None},
-        "third_party_5h": {"fraction": 1.0, "reset_time": None},
-        "third_party_weekly": {"fraction": 1.0, "reset_time": None},
-        "remaining_fraction": 1.0,
-        "reset_time": None,
-        "updated_at": int(time.time())
-    }
+    quota_data = _cached_quota_state(account.get("last_quota"))
 
     quota_error = None
-    # Primary: retrieveUserQuotaSummary
     try:
         req = urllib.request.Request(
             f"{BACKEND_URL_BASE}/v1internal:retrieveUserQuotaSummary",
@@ -483,7 +548,6 @@ def query_quota(account):
         with urllib.request.urlopen(req, timeout=10) as resp:
             res = json.loads(resp.read().decode())
 
-        # If previously marked restricted, clear on success
         if account.get("status") in ("validation_required", "auth_error"):
             account.pop("status", None)
             account.pop("validation_url", None)
@@ -492,160 +556,73 @@ def query_quota(account):
 
         found_quota = False
         for group in res.get("groups", []):
-            for b in group.get("buckets", []):
-                bid = b.get("bucketId", "")
-                frac = float(b.get("remainingFraction", 1.0))
-                rt = b.get("resetTime")
+            for bucket in group.get("buckets", []):
+                bid = bucket.get("bucketId", "")
+                fraction = _quota_fraction(bucket.get("remainingFraction"))
+                if fraction is None:
+                    continue
+                reset = bucket.get("resetTime")
                 if "gemini" in bid:
-                    if "5h" in bid or b.get("window") == "5h":
-                        quota_data["gemini_5h"] = {"fraction": frac, "reset_time": rt}
+                    if "5h" in bid or bucket.get("window") == "5h":
+                        quota_data["gemini_5h"] = {"fraction": fraction, "reset_time": reset}
                         found_quota = True
-                    elif "weekly" in bid or b.get("window") == "weekly":
-                        quota_data["gemini_weekly"] = {"fraction": frac, "reset_time": rt}
+                    elif "weekly" in bid or bucket.get("window") == "weekly":
+                        quota_data["gemini_weekly"] = {"fraction": fraction, "reset_time": reset}
                         found_quota = True
                 elif "3p" in bid:
-                    if "5h" in bid or b.get("window") == "5h":
-                        quota_data["third_party_5h"] = {"fraction": frac, "reset_time": rt}
-                    elif "weekly" in bid or b.get("window") == "weekly":
-                        quota_data["third_party_weekly"] = {"fraction": frac, "reset_time": rt}
-
+                    if "5h" in bid or bucket.get("window") == "5h":
+                        quota_data["third_party_5h"] = {"fraction": fraction, "reset_time": reset}
+                    elif "weekly" in bid or bucket.get("window") == "weekly":
+                        quota_data["third_party_weekly"] = {"fraction": fraction, "reset_time": reset}
         if not found_quota:
             raise ValueError("quota response contained no Gemini quota buckets")
-        g5_f = quota_data["gemini_5h"]["fraction"]
-        gw_f = quota_data["gemini_weekly"]["fraction"]
-        quota_data["remaining_fraction"] = min(g5_f, gw_f)
-        quota_data["reset_time"] = quota_data["gemini_5h"]["reset_time"] if g5_f <= gw_f else quota_data["gemini_weekly"]["reset_time"]
 
     except urllib.error.HTTPError as e:
         quota_error = e
-        err_body = b""
         try:
             err_body = e.read()
         except Exception:
-            pass
-        if _is_validation_error(e.code, err_body):
-            v_url = _extract_validation_url(err_body)
-            account["status"] = "validation_required"
+            err_body = b""
+        if _is_validation_error(e.code, err_body) or _is_auth_error(e.code, err_body):
+            validation = _is_validation_error(e.code, err_body)
+            status = "validation_required" if validation else "auth_error"
+            delay = 86400 if validation else 3600
+            v_url = _extract_validation_url(err_body) if validation else None
+            account["status"] = status
             if v_url:
                 account["validation_url"] = v_url
-            account["rate_limited_until"] = time.time() + 86400
+            account["rate_limited_until"] = time.time() + delay
             quota_data["gemini_5h"] = {"fraction": 0.0, "reset_time": None}
             quota_data["gemini_weekly"] = {"fraction": 0.0, "reset_time": None}
-            quota_data["remaining_fraction"] = 0.0
-            quota_data["reset_time"] = None
+            _recompute_compat_quota(quota_data)
+            quota_data["updated_at"] = int(time.time())
             account["last_quota"] = quota_data
+
             def update(pool):
                 stored = _find_account(pool, account)
                 if stored:
-                    stored["status"] = "validation_required"
+                    stored["status"] = status
                     if v_url:
                         stored["validation_url"] = v_url
-                    stored["rate_limited_until"] = time.time() + 86400
+                    stored["rate_limited_until"] = account["rate_limited_until"]
                     stored["error_count"] = stored.get("error_count", 0) + 1
                     stored["last_quota"] = quota_data
             pool_transaction(update)
             return quota_data
-        elif _is_auth_error(e.code, err_body):
-            account["status"] = "auth_error"
-            account["rate_limited_until"] = time.time() + 3600
-            quota_data["gemini_5h"] = {"fraction": 0.0, "reset_time": None}
-            quota_data["gemini_weekly"] = {"fraction": 0.0, "reset_time": None}
-            quota_data["remaining_fraction"] = 0.0
-            quota_data["reset_time"] = None
-            account["last_quota"] = quota_data
-            def update(pool):
-                stored = _find_account(pool, account)
-                if stored:
-                    stored["status"] = "auth_error"
-                    stored["rate_limited_until"] = time.time() + 3600
-                    stored["error_count"] = stored.get("error_count", 0) + 1
-                    stored["last_quota"] = quota_data
-            pool_transaction(update)
-            return quota_data
-        else:
-            try:
-                req = urllib.request.Request(
-                    f"{BACKEND_URL_BASE}/v1internal:fetchAvailableModels",
-                    data=b"{}",
-                    headers=headers,
-                    method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    res = json.loads(resp.read().decode())
-                models = res.get("models", {})
-                default_model = res.get("defaultAgentModelId")
-                candidates_m = [default_model] if default_model else []
-                candidates_m += ["gemini-3.8-flash-high", "gemini-3.6-flash-high", "gemini-3.5-flash-medium"]
-                found_quota = False
-                for tm in candidates_m:
-                    if tm and tm in models and "quotaInfo" in models[tm]:
-                        qinfo = models[tm]["quotaInfo"]
-                        f = float(qinfo.get("remainingFraction", 1.0))
-                        r = qinfo.get("resetTime")
-                        quota_data["gemini_5h"] = {"fraction": f, "reset_time": r}
-                        quota_data["remaining_fraction"] = f
-                        quota_data["reset_time"] = r
-                        found_quota = True
-                        break
-                if not found_quota:
-                    for tm, minfo in models.items():
-                        if isinstance(minfo, dict) and "quotaInfo" in minfo:
-                            qinfo = minfo["quotaInfo"]
-                            f = float(qinfo.get("remainingFraction", 1.0))
-                            r = qinfo.get("resetTime")
-                            quota_data["gemini_5h"] = {"fraction": f, "reset_time": r}
-                            quota_data["remaining_fraction"] = f
-                            quota_data["reset_time"] = r
-                            found_quota = True
-                            break
-                if not found_quota:
-                    raise ValueError("model response contained no quota information")
-            except Exception as fallback_error:
-                raise fallback_error from quota_error
-
-    except Exception as e:
-        quota_error = e
-        # Fallback to fetchAvailableModels
         try:
-            req = urllib.request.Request(
-                f"{BACKEND_URL_BASE}/v1internal:fetchAvailableModels",
-                data=b"{}",
-                headers=headers,
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                res = json.loads(resp.read().decode())
-            models = res.get("models", {})
-            default_model = res.get("defaultAgentModelId")
-            candidates_m = [default_model] if default_model else []
-            candidates_m += ["gemini-3.8-flash-high", "gemini-3.6-flash-high", "gemini-3.5-flash-medium"]
-            found_quota = False
-            for tm in candidates_m:
-                if tm and tm in models and "quotaInfo" in models[tm]:
-                    qinfo = models[tm]["quotaInfo"]
-                    f = float(qinfo.get("remainingFraction", 1.0))
-                    r = qinfo.get("resetTime")
-                    quota_data["gemini_5h"] = {"fraction": f, "reset_time": r}
-                    quota_data["remaining_fraction"] = f
-                    quota_data["reset_time"] = r
-                    found_quota = True
-                    break
-            if not found_quota:
-                for tm, minfo in models.items():
-                    if isinstance(minfo, dict) and "quotaInfo" in minfo:
-                        qinfo = minfo["quotaInfo"]
-                        f = float(qinfo.get("remainingFraction", 1.0))
-                        r = qinfo.get("resetTime")
-                        quota_data["gemini_5h"] = {"fraction": f, "reset_time": r}
-                        quota_data["remaining_fraction"] = f
-                        quota_data["reset_time"] = r
-                        found_quota = True
-                        break
-            if not found_quota:
-                raise ValueError("model response contained no quota information")
+            _fetch_available_models_quota(headers, quota_data)
         except Exception as fallback_error:
             raise fallback_error from quota_error
 
+    except Exception as e:
+        quota_error = e
+        try:
+            _fetch_available_models_quota(headers, quota_data)
+        except Exception as fallback_error:
+            raise fallback_error from quota_error
+
+    _recompute_compat_quota(quota_data)
+    quota_data["updated_at"] = int(time.time())
     account["last_quota"] = quota_data
     return quota_data
 
@@ -674,7 +651,7 @@ def format_remaining_time(iso_reset_time):
 
 def render_progress_bar(fraction, width=10):
     if fraction is None:
-        fraction = 0.0
+        return f"{CLR_DIM}[{'░' * width}]   N/A{CLR_RESET}"
     fraction = max(0.0, min(1.0, float(fraction)))
     filled = int(round(fraction * width))
     bar = "█" * filled + "░" * (width - filled)
@@ -686,6 +663,20 @@ def render_progress_bar(fraction, width=10):
     else:
         color = CLR_RED
     return f"{color}[{bar}] {pct}{CLR_RESET}"
+
+
+def _display_quota_fractions(quota):
+    """Return explicit window values, with legacy combined quota as a fallback."""
+    quota = quota if isinstance(quota, dict) else {}
+    explicit = "gemini_5h" in quota or "gemini_weekly" in quota
+    g5 = quota.get("gemini_5h")
+    weekly = quota.get("gemini_weekly")
+    q5 = _quota_fraction(g5.get("fraction")) if isinstance(g5, dict) else None
+    q7 = _quota_fraction(weekly.get("fraction")) if isinstance(weekly, dict) else None
+    if not explicit:
+        legacy = _quota_fraction(quota.get("remaining_fraction"))
+        q5 = q7 = legacy
+    return q5, q7
 
 
 # ----------------- Account Login Flow -----------------
@@ -901,8 +892,9 @@ def do_login():
         _persist_account_fields(account_entry, REFRESH_PERSIST_FIELDS)
         g5 = q.get("gemini_5h", {})
         gw = q.get("gemini_weekly", {})
-        print(f"  • Gemini 5h    : {render_progress_bar(g5.get('fraction', 1.0))} (Resets {format_remaining_time(g5.get('reset_time'))})")
-        print(f"  • Gemini Weekly: {render_progress_bar(gw.get('fraction', 1.0))} (Resets {format_remaining_time(gw.get('reset_time'))})")
+        g5_fraction, weekly_fraction = _display_quota_fractions(q)
+        print(f"  • Gemini 5h    : {render_progress_bar(g5_fraction)} (Resets {format_remaining_time(g5.get('reset_time'))})")
+        print(f"  • Gemini Weekly: {render_progress_bar(weekly_fraction)} (Resets {format_remaining_time(gw.get('reset_time'))})")
     except Exception as e:
         print(f"  {CLR_YELLOW}Quota probe warning: {e}{CLR_RESET}")
 
@@ -1053,17 +1045,17 @@ def list_accounts():
         tp5 = q.get("third_party_5h", {})
         status = acc.get("status")
 
-        g5_frac = g5.get("fraction", q.get("remaining_fraction", 1.0))
-        g5_reset = format_remaining_time(g5.get("reset_time", q.get("reset_time")))
-        gw_frac = gw.get("fraction", 1.0)
-        gw_reset = format_remaining_time(gw.get("reset_time"))
+        g5_frac, gw_frac = _display_quota_fractions(q)
+        legacy_reset = q.get("reset_time") if "gemini_5h" not in q and "gemini_weekly" not in q else None
+        g5_reset = format_remaining_time(g5.get("reset_time", legacy_reset))
+        gw_reset = format_remaining_time(gw.get("reset_time", legacy_reset))
 
         g5_bar = render_progress_bar(g5_frac, width=10)
         gw_bar = render_progress_bar(gw_frac, width=10)
 
         now_ts = time.time()
         is_cooling = acc.get("rate_limited_until", 0) > now_ts
-        is_exhausted = (g5_frac <= 0.005) or (gw_frac <= 0.005)
+        is_exhausted = any(fraction is not None and fraction <= 0.005 for fraction in (g5_frac, gw_frac))
 
         hits = acc.get("gen_count", acc.get("request_count", 0))
 
@@ -1203,8 +1195,7 @@ def switch_account(target=None, silent=False):
     q = selected.get("last_quota", {})
     g5 = q.get("gemini_5h", {})
     gw = q.get("gemini_weekly", {})
-    g5_frac = g5.get("fraction", q.get("remaining_fraction", 1.0))
-    gw_frac = gw.get("fraction", 1.0)
+    g5_frac, gw_frac = _display_quota_fractions(q)
     if not silent:
         print(f"{CLR_GREEN}✓ Active account switched to: {CLR_BOLD}{selected.get('email')}{CLR_RESET}")
         print(f"  • Gemini 5h    : {render_progress_bar(g5_frac)} (Resets {format_remaining_time(g5.get('reset_time'))})")
@@ -1892,118 +1883,67 @@ def _parse_iso_or_timestamp(val):
 
 
 def compute_capacity_state(account, now=None):
-    """
-    Computes reset-aware capacity metrics for an account across 5-hour and 7-day quota windows.
-
-    Pace metric: pace = remaining_fraction - (remaining_time / window_length).
-    Positive pace indicates capacity surplus above linear burn;
-    negative pace indicates capacity deficit / bottleneck.
-
-    Returns dict containing:
-      - q5, q7: raw remaining fractions in [0.0, 1.0]
-      - r5, r7: remaining time fractions of windows in [0.0, 1.0]
-      - pace5, pace7: capacity pace scores (q - r)
-      - worst_pace: min(pace5, pace7)
-      - total_pace: pace5 + pace7
-      - raw_floor: min(q5, q7)
-      - is_depleted: raw_floor <= 0.005
-    """
+    """Compute reset-aware capacity without treating missing fractions as full quota."""
     if now is None:
         now = time.time()
+    quota = account.get("last_quota")
+    quota = quota if isinstance(quota, dict) else {}
+    g5 = quota.get("gemini_5h")
+    weekly = quota.get("gemini_weekly")
+    has_explicit_windows = "gemini_5h" in quota or "gemini_weekly" in quota
 
-    q = account.get("last_quota")
-    if not isinstance(q, dict):
-        q = {}
+    q5 = _quota_fraction(g5.get("fraction")) if isinstance(g5, dict) else None
+    q7 = _quota_fraction(weekly.get("fraction")) if isinstance(weekly, dict) else None
+    q5_known = q5 is not None
+    q7_known = q7 is not None
+    legacy_fraction_known = False
 
-    # Extract 5-hour quota fraction
-    g5_dict = q.get("gemini_5h")
-    if isinstance(g5_dict, dict) and g5_dict.get("fraction") is not None:
-        raw_q5 = g5_dict.get("fraction")
-    elif q.get("remaining_fraction") is not None:
-        raw_q5 = q.get("remaining_fraction")
-    elif account.get("gemini_5h_pct") is not None:
-        raw_q5 = account.get("gemini_5h_pct") / 100.0
-    elif account.get("quota") is not None:
-        raw_q5 = account.get("quota")
-    else:
-        raw_q5 = 1.0
-
-    try:
-        q5 = max(0.0, min(1.0, float(raw_q5)))
-    except (ValueError, TypeError):
-        q5 = 1.0
-
-    # Extract weekly quota fraction
-    gw_dict = q.get("gemini_weekly")
-    if isinstance(gw_dict, dict) and gw_dict.get("fraction") is not None:
-        raw_q7 = gw_dict.get("fraction")
-    elif account.get("gemini_weekly_pct") is not None:
-        raw_q7 = account.get("gemini_weekly_pct") / 100.0
-    elif account.get("weekly_quota") is not None:
-        raw_q7 = account.get("weekly_quota")
-    elif q.get("remaining_fraction") is not None:
-        raw_q7 = q.get("remaining_fraction")
-    elif account.get("quota") is not None:
-        raw_q7 = account.get("quota")
-    else:
-        raw_q7 = 1.0
-
-    try:
-        q7 = max(0.0, min(1.0, float(raw_q7)))
-    except (ValueError, TypeError):
-        q7 = 1.0
-
-    # Extract reset timestamps or remaining seconds
-    reset_val_5 = None
-    if isinstance(g5_dict, dict):
-        reset_val_5 = g5_dict.get("reset_time")
-    if reset_val_5 is None:
-        reset_val_5 = q.get("reset_time")
-    if reset_val_5 is None:
-        reset_val_5 = account.get("gemini_5h_reset")
-
-    reset_val_7 = None
-    if isinstance(gw_dict, dict):
-        reset_val_7 = gw_dict.get("reset_time")
-    if reset_val_7 is None:
-        reset_val_7 = account.get("gemini_weekly_reset")
-
-    # 5-hour window ratio r5
-    if account.get("gemini_5h_reset_sec") is not None:
-        try:
-            t5 = float(account["gemini_5h_reset_sec"])
-            r5 = 1.0 if t5 <= 0 else min(1.0, t5 / WINDOW_5H_SECS)
-        except (ValueError, TypeError):
-            r5 = 1.0
-    else:
-        ts5 = _parse_iso_or_timestamp(reset_val_5)
-        if ts5 is None:
-            r5 = 1.0
+    if not has_explicit_windows:
+        legacy = _quota_fraction(quota.get("remaining_fraction"))
+        if legacy is None:
+            legacy = _quota_fraction(account.get("quota"))
+        if legacy is not None:
+            # A legacy combined floor remains schedulable, but is one source of
+            # evidence rather than two independently measured windows.
+            q5 = q7 = legacy
+            legacy_fraction_known = True
         else:
-            diff5 = ts5 - now
-            r5 = 1.0 if diff5 <= 0 else min(1.0, diff5 / WINDOW_5H_SECS)
+            q5_pct = _quota_fraction(account.get("gemini_5h_pct") / 100.0) if account.get("gemini_5h_pct") is not None else None
+            q7_pct = _quota_fraction(account.get("gemini_weekly_pct") / 100.0) if account.get("gemini_weekly_pct") is not None else None
+            q5, q7 = q5_pct, q7_pct
+            q5_known, q7_known = q5 is not None, q7 is not None
 
-    # 7-day window ratio r7
-    if account.get("gemini_weekly_reset_sec") is not None:
-        try:
-            t7 = float(account["gemini_weekly_reset_sec"])
-            r7 = 1.0 if t7 <= 0 else min(1.0, t7 / WINDOW_7D_SECS)
-        except (ValueError, TypeError):
-            r7 = 1.0
-    else:
-        ts7 = _parse_iso_or_timestamp(reset_val_7)
-        if ts7 is None:
-            r7 = 1.0
-        else:
-            diff7 = ts7 - now
-            r7 = 1.0 if diff7 <= 0 else min(1.0, diff7 / WINDOW_7D_SECS)
+    reset5 = g5.get("reset_time") if isinstance(g5, dict) else None
+    reset7 = weekly.get("reset_time") if isinstance(weekly, dict) else None
+    if legacy_fraction_known:
+        reset5 = reset7 = quota.get("reset_time")
+    elif not has_explicit_windows:
+        reset5 = account.get("gemini_5h_reset")
+        reset7 = account.get("gemini_weekly_reset")
 
-    pace5 = q5 - r5
-    pace7 = q7 - r7
-    worst_pace = min(pace5, pace7)
-    total_pace = pace5 + pace7
-    raw_floor = min(q5, q7)
-    is_depleted = (raw_floor <= 0.005)
+    def reset_ratio(seconds_key, reset, window_seconds):
+        if account.get(seconds_key) is not None:
+            try:
+                remaining = float(account[seconds_key])
+                return 1.0 if remaining <= 0 else min(1.0, remaining / window_seconds)
+            except (TypeError, ValueError):
+                return 1.0
+        timestamp = _parse_iso_or_timestamp(reset)
+        if timestamp is None:
+            return 1.0
+        remaining = timestamp - now
+        return 1.0 if remaining <= 0 else min(1.0, remaining / window_seconds)
+
+    r5 = reset_ratio("gemini_5h_reset_sec", reset5, WINDOW_5H_SECS)
+    r7 = reset_ratio("gemini_weekly_reset_sec", reset7, WINDOW_7D_SECS)
+    pace5 = q5 - r5 if q5 is not None else None
+    pace7 = q7 - r7 if q7 is not None else None
+    known_paces = [pace for pace in (pace5, pace7) if pace is not None]
+    known_fractions = [fraction for fraction in (q5, q7) if fraction is not None]
+    known_window_count = 1 if legacy_fraction_known else q5_known + q7_known
+    worst_pace = min(known_paces) if known_paces else float("-inf")
+    total_pace = sum(known_paces) if known_paces else float("-inf")
+    raw_floor = min(known_fractions) if known_fractions else 0.0
 
     return {
         "q5": q5,
@@ -2015,7 +1955,11 @@ def compute_capacity_state(account, now=None):
         "worst_pace": worst_pace,
         "total_pace": total_pace,
         "raw_floor": raw_floor,
-        "is_depleted": is_depleted,
+        "q5_known": q5_known,
+        "q7_known": q7_known,
+        "known_window_count": known_window_count,
+        "legacy_fraction_known": legacy_fraction_known,
+        "is_depleted": bool(known_fractions) and raw_floor <= 0.005,
     }
 
 
@@ -2078,6 +2022,7 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
             hits = a.get("gen_count", a.get("request_count", 0))
             return (
                 hits,
+                -cap["known_window_count"],
                 -cap["worst_pace"],
                 -cap["total_pace"],
                 -cap["raw_floor"],
@@ -2096,6 +2041,7 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
             cap = compute_capacity_state(a, now=now)
             hits = a.get("gen_count", a.get("request_count", 0))
             return (
+                cap["known_window_count"],
                 cap["worst_pace"],
                 cap["total_pace"],
                 cap["raw_floor"],

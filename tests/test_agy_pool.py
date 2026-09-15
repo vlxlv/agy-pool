@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.parse
 from datetime import datetime, timezone
 from unittest import mock
@@ -140,6 +141,96 @@ class AgyPoolTest(unittest.TestCase):
         result = (response.status, data, dict(response.getheaders()))
         conn.close()
         return result
+
+    def test_unknown_quota_does_not_beat_known_capacity(self):
+        now = time.time()
+        known = account("known")
+        known["last_quota"] = {
+            "gemini_5h": {"fraction": 0.70, "reset_time": now + 3600},
+            "gemini_weekly": {"fraction": 0.70, "reset_time": now + 86400},
+        }
+        unknown = account("unknown")
+        unknown["last_quota"] = {}
+        ordered = agy_pool.order_candidates([unknown, known], now=now)
+        self.assertEqual([a["id"] for a in ordered], ["known", "unknown"])
+        self.assertEqual(agy_pool.compute_capacity_state(unknown)["known_window_count"], 0)
+
+    def test_known_full_quota_is_distinct_from_unknown(self):
+        full = account("full")
+        full["last_quota"] = {
+            "gemini_5h": {"fraction": 1.0},
+            "gemini_weekly": {"fraction": 1.0},
+        }
+        unknown = account("unknown")
+        unknown["last_quota"] = {}
+        state = agy_pool.compute_capacity_state(full)
+        self.assertEqual(state["known_window_count"], 2)
+        self.assertEqual(agy_pool.compute_capacity_state(unknown)["known_window_count"], 0)
+
+    def test_fallback_5h_refresh_preserves_cached_weekly(self):
+        account_data = account("partial")
+        account_data["last_quota"] = {
+            "gemini_5h": {"fraction": 0.60, "reset_time": "old-5h"},
+            "gemini_weekly": {"fraction": 0.20, "reset_time": "old-weekly"},
+        }
+        fallback = mock.MagicMock()
+        fallback.__enter__.return_value = fallback
+        fallback.read.return_value = json.dumps({
+            "models": {"gemini-3.8-flash-high": {"quotaInfo": {"remainingFraction": 0.80, "resetTime": "new-5h"}}}
+        }).encode()
+        primary_error = urllib.error.HTTPError("https://quota", 500, "error", {}, io.BytesIO(b"temporary"))
+        with mock.patch.object(agy_pool.urllib.request, "urlopen", side_effect=[primary_error, fallback]), mock.patch.object(agy_pool, "refresh_token", return_value="token"):
+            result = agy_pool.query_quota(account_data)
+        self.assertEqual(result["gemini_5h"]["fraction"], 0.80)
+        self.assertEqual(result["gemini_weekly"]["fraction"], 0.20)
+
+    def test_partial_quota_merge_preserves_cached_weekly(self):
+        account_data = account("partial")
+        account_data["last_quota"] = {
+            "gemini_5h": {"fraction": 0.60, "reset_time": "old-5h"},
+            "gemini_weekly": {"fraction": 0.20, "reset_time": "old-weekly"},
+        }
+        merged = agy_pool._cached_quota_state(account_data["last_quota"])
+        merged["gemini_5h"] = {"fraction": 0.80, "reset_time": "new-5h"}
+        agy_pool._recompute_compat_quota(merged)
+        self.assertEqual(merged["gemini_5h"]["fraction"], 0.80)
+        self.assertEqual(merged["gemini_weekly"]["fraction"], 0.20)
+
+    def test_partial_quota_without_cached_weekly_stays_unknown(self):
+        merged = agy_pool._cached_quota_state({})
+        merged["gemini_5h"] = {"fraction": 0.80, "reset_time": None}
+        agy_pool._recompute_compat_quota(merged)
+        self.assertNotIn("gemini_weekly", merged)
+        self.assertEqual(merged["remaining_fraction"], 0.80)
+
+    def test_complete_quota_refresh_failure_does_not_replace_cache(self):
+        account_data = account("cached")
+        cached = {"gemini_5h": {"fraction": 0.40}, "gemini_weekly": {"fraction": 0.30}}
+        account_data["last_quota"] = cached
+        with mock.patch.object(agy_pool, "refresh_token", return_value="token"), \
+             mock.patch.object(agy_pool.urllib.request, "urlopen", side_effect=OSError("offline")):
+            with self.assertRaises(OSError):
+                agy_pool.query_quota(account_data)
+        self.assertEqual(account_data["last_quota"], cached)
+
+    def test_validation_and_auth_are_known_unavailable(self):
+        account_data = account("restricted")
+        state = agy_pool.compute_capacity_state(account_data)
+        self.assertFalse(state["is_depleted"])
+        account_data["last_quota"] = {
+            "gemini_5h": {"fraction": 0.0}, "gemini_weekly": {"fraction": 0.0}
+        }
+        self.assertTrue(agy_pool.compute_capacity_state(account_data)["is_depleted"])
+
+    def test_legacy_remaining_fraction_is_supported(self):
+        state = agy_pool.compute_capacity_state({"last_quota": {"remaining_fraction": 0.4}})
+        self.assertEqual(state["known_window_count"], 1)
+        self.assertEqual(state["q5"], 0.4)
+        self.assertEqual(state["q7"], 0.4)
+
+    def test_unknown_quota_cli_display_is_not_full(self):
+        self.assertIn("N/A", agy_pool.render_progress_bar(None))
+        self.assertNotIn("100.0%", agy_pool.render_progress_bar(None))
 
     def test_threaded_request_count_transaction_has_no_lost_updates(self):
         self.save_accounts([account("a")])

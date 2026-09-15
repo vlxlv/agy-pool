@@ -626,47 +626,27 @@ def compute_capacity_state(account: Dict[str, Any], now: Optional[float] = None)
         q = {}
 
     g5_dict = q.get("gemini_5h")
-    if isinstance(g5_dict, dict) and g5_dict.get("fraction") is not None:
-        raw_q5 = g5_dict.get("fraction")
-    elif q.get("remaining_fraction") is not None:
-        raw_q5 = q.get("remaining_fraction")
-    elif account.get("gemini_5h_pct") is not None:
-        raw_q5 = account.get("gemini_5h_pct") / 100.0
-    elif account.get("quota") is not None:
-        raw_q5 = account.get("quota")
-    else:
-        raw_q5 = 1.0
-
-    try:
-        q5 = max(0.0, min(1.0, float(raw_q5)))
-    except (ValueError, TypeError):
-        q5 = 1.0
-
     gw_dict = q.get("gemini_weekly")
-    if isinstance(gw_dict, dict) and gw_dict.get("fraction") is not None:
-        raw_q7 = gw_dict.get("fraction")
-    elif account.get("gemini_weekly_pct") is not None:
-        raw_q7 = account.get("gemini_weekly_pct") / 100.0
-    elif account.get("weekly_quota") is not None:
-        raw_q7 = account.get("weekly_quota")
-    elif q.get("remaining_fraction") is not None:
-        raw_q7 = q.get("remaining_fraction")
-    elif account.get("quota") is not None:
-        raw_q7 = account.get("quota")
-    else:
-        raw_q7 = 1.0
-
+    has_windows = "gemini_5h" in q or "gemini_weekly" in q
+    raw_q5 = g5_dict.get("fraction") if isinstance(g5_dict, dict) else None
+    raw_q7 = gw_dict.get("fraction") if isinstance(gw_dict, dict) else None
+    if not has_windows:
+        raw_q5 = raw_q7 = q.get("remaining_fraction", account.get("quota"))
     try:
-        q7 = max(0.0, min(1.0, float(raw_q7)))
+        q5 = max(0.0, min(1.0, float(raw_q5))) if raw_q5 is not None else None
     except (ValueError, TypeError):
-        q7 = 1.0
+        q5 = None
+    try:
+        q7 = max(0.0, min(1.0, float(raw_q7))) if raw_q7 is not None else None
+    except (ValueError, TypeError):
+        q7 = None
 
     reset_val_5 = None
     if isinstance(g5_dict, dict):
         reset_val_5 = g5_dict.get("reset_time")
-    if reset_val_5 is None:
+    if not has_windows and reset_val_5 is None:
         reset_val_5 = q.get("reset_time")
-    if reset_val_5 is None:
+    if not has_windows and reset_val_5 is None:
         reset_val_5 = account.get("gemini_5h_reset")
 
     reset_val_7 = None
@@ -703,12 +683,14 @@ def compute_capacity_state(account: Dict[str, Any], now: Optional[float] = None)
             diff7 = ts7 - now
             r7 = 1.0 if diff7 <= 0 else min(1.0, diff7 / WINDOW_7D_SECS)
 
-    pace5 = q5 - r5
-    pace7 = q7 - r7
-    worst_pace = min(pace5, pace7)
-    total_pace = pace5 + pace7
-    raw_floor = min(q5, q7)
-    is_depleted = (raw_floor <= 0.005)
+    pace5 = q5 - r5 if q5 is not None else None
+    pace7 = q7 - r7 if q7 is not None else None
+    paces = [p for p in (pace5, pace7) if p is not None]
+    fractions = [f for f in (q5, q7) if f is not None]
+    worst_pace = min(paces) if paces else float("-inf")
+    total_pace = sum(paces) if paces else float("-inf")
+    raw_floor = min(fractions) if fractions else 0.0
+    is_depleted = bool(fractions) and raw_floor <= 0.005
 
     return {
         "q5": q5,
@@ -721,6 +703,9 @@ def compute_capacity_state(account: Dict[str, Any], now: Optional[float] = None)
         "total_pace": total_pace,
         "raw_floor": raw_floor,
         "is_depleted": is_depleted,
+        "q5_known": q5 is not None,
+        "q7_known": q7 is not None,
+        "known_window_count": int(q5 is not None) + int(q7 is not None),
     }
 
 
@@ -781,6 +766,7 @@ def verify_least_used(
         def _lu_tie_key(a):
             cap = compute_capacity_state(a, now=now)
             return (
+                -cap["known_window_count"],
                 -cap["worst_pace"],
                 -cap["total_pace"],
                 -cap["raw_floor"],
@@ -856,13 +842,18 @@ def verify_max_quota(
         cap = compute_capacity_state(a, now=now)
         hits = a.get("hits", a.get("gen_count", a.get("request_count", 0)))
         return (
+            cap["known_window_count"],
             cap["worst_pace"],
             cap["total_pace"],
             cap["raw_floor"],
             -hits
         )
 
-    # Sort eligible by capacity pace desc, raw floor desc, hits asc
+    # A text/JSON snapshot with unknown windows cannot reliably prove capacity order.
+    if any(compute_capacity_state(a, now=now)["known_window_count"] < 2 for a in eligible):
+        return {"passed": True, "status": "INCONCLUSIVE", "reason": "Quota snapshot is partial or unknown"}
+
+    # Sort eligible by quota confidence, capacity pace desc, raw floor desc, hits asc
     sorted_eligible = sorted(
         eligible,
         key=_mq_key,
