@@ -69,11 +69,10 @@ for rc in "${SHELL_FILES[@]}"; do
 
 # >>> agy-pool integration >>>
 alias agy='agy-pool run'
-alias agy-raw='agy-raw'
 alias agy-orig='agy-raw'
 # <<< agy-pool integration <<<
 EOF
-        echo -e "\033[32m[✓] Added 'alias agy=agy-pool run' and 'agy-raw / agy-orig' to $rc\033[0m"
+        echo -e "\033[32m[✓] Added 'alias agy=agy-pool run' and 'agy-orig' to $rc\033[0m"
     fi
 done
 
