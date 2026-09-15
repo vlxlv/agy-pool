@@ -217,8 +217,14 @@ def parse_log_delta(log_path: str, start_offset: int = 0) -> Dict[str, Any]:
     dispatches = []
     failovers = []
     new_offset = start_offset
+    truncated = False
 
     try:
+        file_size = os.path.getsize(log_path)
+        if start_offset > file_size:
+            truncated = True
+            start_offset = 0
+
         with open(log_path, "r", encoding="utf-8", errors="replace") as f:
             f.seek(start_offset)
             for line in f:
@@ -294,6 +300,7 @@ def parse_log_delta(log_path: str, start_offset: int = 0) -> Dict[str, Any]:
         "dispatches": dispatches,
         "failovers": failovers,
         "total_events": len(events),
+        "truncated": truncated,
     }
 
 
@@ -379,11 +386,14 @@ def verify_round_robin(
                 "step": idx,
             }
 
-    # If initial_last_id is known, check that first dispatch starts immediately after it
+    # If initial_last_id is known, check that first dispatch starts immediately after it.
+    # If initial_last_id is stale/not in eligible, production falls back to eligible[0].
     start_pos = eligible_emails.index(dispatches[0])
     if initial_last_id:
+        found = False
         for i, a in enumerate(eligible):
             if a.get("id") == initial_last_id or a.get("email") == initial_last_id:
+                found = True
                 expected_start_pos = (i + 1) % n_eligible
                 if start_pos != expected_start_pos:
                     return {
@@ -392,6 +402,14 @@ def verify_round_robin(
                         "step": 0,
                     }
                 break
+        if not found:
+            # Stale or removed cursor: production starts at unrotated eligible[0]
+            if start_pos != 0:
+                return {
+                    "passed": False,
+                    "reason": f"Initial step: stale cursor '{initial_last_id}' expected fallback to '{eligible_emails[0]}', got '{dispatches[0]}'",
+                    "step": 0,
+                }
 
     # Check cyclic rotation for each consecutive step
     cur_pos = start_pos
@@ -462,6 +480,43 @@ def verify_least_used(
                 "min_available_hits": min_hits_val,
             }
 
+        # Check production tie-breaking among candidates with equal min hits:
+        # Sort by higher remaining quota, then stable account ID
+        min_accounts = [
+            a for a in eligible if sim_hits[a.get("email") or a.get("id")] == min_hits_val
+        ]
+        min_accounts.sort(
+            key=lambda a: (-round(a.get("quota", 1.0), 2), a.get("id", ""))
+        )
+        expected_top = min_accounts[0].get("email") or min_accounts[0].get("id")
+
+        if d != expected_top and len(min_accounts) > 1:
+            expected_q = round(min_accounts[0].get("quota", 1.0), 2)
+            actual_acc = next((a for a in min_accounts if (a.get("email") == d or a.get("id") == d)), None)
+            actual_q = round(actual_acc.get("quota", 1.0), 2) if actual_acc else 0.0
+            if actual_q < expected_q:
+                return {
+                    "passed": False,
+                    "reason": (
+                        f"Step {idx}: tie-breaker failed. Both had {min_hits_val} hits, but '{expected_top}' "
+                        f"had higher quota ({expected_q}) than '{d}' ({actual_q})"
+                    ),
+                    "step": idx,
+                    "expected": expected_top,
+                    "actual": d,
+                }
+            elif actual_acc and (actual_acc.get("id", "") != min_accounts[0].get("id", "")) and actual_q == expected_q:
+                return {
+                    "passed": False,
+                    "reason": (
+                        f"Step {idx}: tie-breaker failed. Equal hits ({min_hits_val}) and equal quota ({actual_q}), "
+                        f"expected ID '{min_accounts[0].get('id')}' ('{expected_top}'), got '{actual_acc.get('id')}' ('{d}')"
+                    ),
+                    "step": idx,
+                    "expected": expected_top,
+                    "actual": d,
+                }
+
         # Increment simulated hits for next step
         sim_hits[d] += 1
 
@@ -518,30 +573,60 @@ def verify_max_quota(
 def detect_concurrent_activity(
     expected_runs: int,
     dispatches: List[str],
-    hits_delta: Dict[str, Any]
+    hits_delta: Dict[str, Any],
+    tolerance_ratio: float = 2.0
 ) -> Dict[str, Any]:
     """
     Detect whether external concurrent requests were processed by the pool during the test.
+    The tolerance_ratio (default 2.0) acts as an ambiguity heuristic, not proof of clean traffic:
+    - 9 -> 10 dispatches: Minor internal sub-dispatch within nominal slack (<= expected_runs + 1).
+      Evaluates to CLEAN (not a false positive).
+    - Intermediate excess traffic (e.g. 9 -> 14 dispatches): Exceeds nominal slack but within
+      tolerance_ratio. Evaluates to INCONCLUSIVE (warns rather than silently passing).
+    - 9 -> 25 dispatches: Exceeds tolerance_ratio. Evaluates to CONCURRENT.
     """
     observed_dispatches = len(dispatches)
     total_delta = hits_delta.get("total_delta", 0)
+    gcd_val = hits_delta.get("gcd", 1) or 1
 
-    # Tolerance: dispatches exceeding expected runs
-    excess_dispatches = observed_dispatches - expected_runs
-    excess_hits = total_delta - (expected_runs * hits_delta.get("gcd", 1))
+    # Nominal slack: single outer CLI call may issue 1 extra sub-request (e.g. metadata/continuation)
+    minor_slack_dispatches = expected_runs + 1
+    minor_slack_hits = (expected_runs + 1) * gcd_val
 
-    is_concurrent = (excess_dispatches > 0) or (excess_hits > expected_runs)
+    # Hard threshold beyond which external traffic is confirmed
+    hard_max_dispatches = max(expected_runs + 2, int(math.ceil(expected_runs * tolerance_ratio)))
+    hard_max_hits = max((expected_runs + 2) * gcd_val, int(math.ceil(expected_runs * tolerance_ratio * gcd_val)))
+
+    if observed_dispatches > hard_max_dispatches or total_delta > hard_max_hits:
+        status = "CONCURRENT"
+        concurrent_detected = True
+        is_inconclusive = False
+        message = (
+            f"Confirmed concurrent external traffic: observed {observed_dispatches} dispatches "
+            f"(expected <= {hard_max_dispatches}) or +{total_delta} Hits (expected <= {hard_max_hits})"
+        )
+    elif observed_dispatches > minor_slack_dispatches or total_delta > minor_slack_hits:
+        status = "INCONCLUSIVE"
+        concurrent_detected = False
+        is_inconclusive = True
+        message = (
+            f"Intermediate excess traffic detected: observed {observed_dispatches} dispatches "
+            f"for {expected_runs} expected runs. Ambiguous between internal multi-dispatch and background pool activity"
+        )
+    else:
+        status = "CLEAN"
+        concurrent_detected = False
+        is_inconclusive = False
+        message = "No concurrent external traffic detected"
 
     return {
-        "concurrent_detected": is_concurrent,
+        "concurrent_detected": concurrent_detected,
+        "is_inconclusive": is_inconclusive,
+        "status": status,
         "expected_runs": expected_runs,
         "observed_dispatches": observed_dispatches,
         "total_hits_delta": total_delta,
-        "message": (
-            "Concurrent pool activity detected during test run"
-            if is_concurrent else
-            "No concurrent external traffic detected"
-        ),
+        "message": message,
     }
 
 

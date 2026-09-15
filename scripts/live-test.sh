@@ -404,13 +404,17 @@ print(json.dumps(delta.get('dispatches', [])))
         --expected "$test_runs" \
         --dispatches "${TMP_DIR}/dispatches.json" \
         --hits-delta "${TMP_DIR}/hits_delta.json")"
-    local concurrent_detected
-    concurrent_detected="$("$PYTHON" -c "import json; print(json.loads('''$conc_res''').get('concurrent_detected', False))")"
+    local traffic_status
+    traffic_status="$("$PYTHON" -c "import json; print(json.loads('''$conc_res''').get('status', 'CLEAN'))")"
+    local traffic_msg
+    traffic_msg="$("$PYTHON" -c "import json; print(json.loads('''$conc_res''').get('message', ''))")"
 
     echo "  • Hits delta: total +${total_hits_delta} (GCD unit: ${gcd_val})"
 
-    if [ "$concurrent_detected" = "True" ]; then
-        echo -e "  • ${CLR_YELLOW}Traffic check: INCONCLUSIVE (concurrent external pool activity detected)${CLR_RESET}"
+    if [ "$traffic_status" = "CONCURRENT" ]; then
+        echo -e "  • ${CLR_RED}Traffic check: CONCURRENT (external pool traffic detected)${CLR_RESET}"
+    elif [ "$traffic_status" = "INCONCLUSIVE" ]; then
+        echo -e "  • ${CLR_YELLOW}Traffic check: INCONCLUSIVE (${traffic_msg})${CLR_RESET}"
     else
         echo -e "  • ${CLR_GREEN}Traffic check: CLEAN (isolated test traffic)${CLR_RESET}"
     fi
@@ -418,6 +422,16 @@ print(json.dumps(delta.get('dispatches', [])))
     if [ "$successful_runs" -gt 0 ] && [ "$zero_hits_delta" = "True" ]; then
         echo -e "\n${CLR_RED}✖ SCHEDULER TEST FAILED: Zero Hits delta observed despite successful requests.${CLR_RESET}" >&2
         verify_passed=false
+    elif [ "$traffic_status" = "CONCURRENT" ]; then
+        echo -e "\n${CLR_YELLOW}⚠ SCHEDULER TEST INCONCLUSIVE: Confirmed concurrent external pool traffic was detected.${CLR_RESET}" >&2
+        verify_passed=false
+    elif [ "$traffic_status" = "INCONCLUSIVE" ]; then
+        echo -e "\n${CLR_YELLOW}⚠ SCHEDULER TEST WARNING (INCONCLUSIVE): Intermediate excess traffic observed; verification result may be ambiguous.${CLR_RESET}"
+        if [ "$verify_passed" = "true" ]; then
+            local detail
+            detail="$("$PYTHON" -c "import json; print(json.loads('''$verify_res''').get('details', 'OK'))")"
+            echo -e "${CLR_GREEN}  ↳ Dispatched sequence matched: ${detail}${CLR_RESET}"
+        fi
     elif [ "$verify_passed" = "true" ]; then
         local detail
         detail="$("$PYTHON" -c "import json; print(json.loads('''$verify_res''').get('details', 'OK'))")"

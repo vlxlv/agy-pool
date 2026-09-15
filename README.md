@@ -167,47 +167,38 @@ Each proxied HTTP request uses the account selected by the gateway and its reque
 
 `agy-pool` includes a dedicated live integration smoke-test harness (`scripts/live-test.sh`) to validate gateway routing, process concurrency, and scheduler rotation on real Linux/VPS environments with native `agy` and live Google accounts.
 
-### Safe Diagnostics (0 Quota Consumed)
+> [!IMPORTANT]
+> Real live tests are manual-only and consume real account quota. They are never executed by GitHub Actions.
+
+### Manual Live Testing (Over SSH)
+
+When validating on a real VPS or Linux host over SSH, execute the test harness directly:
+
 ```bash
-# Run environment diagnostics and binary checks
+# Diagnostic environment check (0 quota consumed)
 ./scripts/live-test.sh doctor
 
-# Check gateway port resolution and listening status
-./scripts/live-test.sh port
-
-# Inspect current pool accounts and readiness
-./scripts/live-test.sh status
-```
-
-### Live Generation & Scheduler Validation
-> [!WARNING]
-> The commands below send real generation requests through the gateway and consume upstream quota. A confirmation prompt is displayed before any request is sent (bypassable with `-y`).
-
-```bash
 # Verify single generation through the gateway proxy
 ./scripts/live-test.sh gateway
 
 # Verify sequential cyclic rotation across ready accounts
-./scripts/live-test.sh round-robin --runs 3
+./scripts/live-test.sh round-robin -n 9
 
 # Verify dispatch prioritization for lowest-hit accounts
-./scripts/live-test.sh least-used --runs 3
+./scripts/live-test.sh least-used -n 6
 
 # Verify dispatch priority to highest remaining quota accounts
-./scripts/live-test.sh max-quota --runs 3
-
-# Run the complete test suite (doctor, port, gateway, scheduler)
-./scripts/live-test.sh all --timeout 45
+./scripts/live-test.sh max-quota -n 3
 ```
 
 ### Key Options & Safety
-- `-n, --runs <N>`: Specify number of generation requests (default: 1-3 depending on pool size).
+- `-n, --runs <N>`: Specify number of generation requests (e.g. `-n 9`, `-n 6`, `-n 3`).
 - `-t, --timeout <sec>`: Per-request timeout in seconds (default: 30s).
 - `-k, --keep-artifacts`: Preserve temporary test logs in `/tmp/agy-live-test.*` for post-mortem debugging.
 - `-j, --json`: Produce machine-readable JSON reports.
 - `-y, --yes`: Auto-confirm live quota consumption warning.
 - **Safety**: Uses POSIX `trap` on `EXIT`, `INT`, and `TERM` to restore original load balancing strategy.
-- **Verification**: Uses gateway log delta tracking for authoritative routing proof, complemented by Hits delta GCD analysis and concurrent traffic detection.
+- **Verification**: Uses gateway log delta tracking for authoritative routing proof, complemented by Hits delta GCD analysis and 3-tier concurrent traffic detection (`CLEAN`, `INCONCLUSIVE`, `CONCURRENT`).
 - **Zero Runtime Dependencies**: Requires only Bash and Python 3.8+ standard library.
 
 ---

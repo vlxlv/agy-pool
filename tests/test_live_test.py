@@ -288,10 +288,152 @@ Refreshing quota for 1 account(s)...
         # Exactly 3 runs expected, 3 observed -> clean
         res = detect_concurrent_activity(3, dispatches, hits_delta)
         self.assertFalse(res["concurrent_detected"])
+        self.assertFalse(res["is_inconclusive"])
+        self.assertEqual(res["status"], "CLEAN")
 
-        # 2 runs expected, 3 observed -> concurrent detected
-        res_conc = detect_concurrent_activity(2, dispatches, hits_delta)
+        # 1 run expected, 10 observed -> concurrent detected
+        res_conc = detect_concurrent_activity(1, ["a@test.com"] * 10, {"total_delta": 10, "gcd": 1})
         self.assertTrue(res_conc["concurrent_detected"])
+        self.assertEqual(res_conc["status"], "CONCURRENT")
+
+    def test_detect_concurrent_activity_multi_dispatch_within_invocation(self):
+        # 1. 9 outer invocations resulting in 10 legitimate internal dispatches -> must NOT be a false positive
+        dispatches_10 = ["a@test.com"] * 10
+        hits_delta_10 = {"total_delta": 10, "gcd": 1}
+        res_10 = detect_concurrent_activity(9, dispatches_10, hits_delta_10)
+        self.assertFalse(res_10["concurrent_detected"], "9 outer invocations with 10 dispatches must not be flagged concurrent")
+        self.assertFalse(res_10["is_inconclusive"], "9 outer invocations with 10 dispatches is within nominal slack")
+        self.assertEqual(res_10["status"], "CLEAN")
+
+        # 2. Intermediate excess traffic (9 outer runs -> 14 dispatches) -> must WARN / evaluate to INCONCLUSIVE, not silently PASS
+        dispatches_14 = ["a@test.com"] * 14
+        hits_delta_14 = {"total_delta": 14, "gcd": 1}
+        res_14 = detect_concurrent_activity(9, dispatches_14, hits_delta_14)
+        self.assertFalse(res_14["concurrent_detected"], "intermediate traffic is not confirmed external concurrent traffic")
+        self.assertTrue(res_14["is_inconclusive"], "intermediate excess traffic must be flagged as INCONCLUSIVE")
+        self.assertEqual(res_14["status"], "INCONCLUSIVE")
+
+        # 3. 9 outer invocations with 25 dispatches -> must be detected as CONCURRENT
+        dispatches_25 = ["a@test.com"] * 25
+        hits_delta_25 = {"total_delta": 25, "gcd": 1}
+        res_25 = detect_concurrent_activity(9, dispatches_25, hits_delta_25)
+        self.assertTrue(res_25["concurrent_detected"], "9 outer invocations with 25 dispatches must be detected as concurrent")
+        self.assertEqual(res_25["status"], "CONCURRENT")
+
+    def test_parse_log_delta_after_rotation_or_truncation(self):
+        with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as f:
+            log_path = f.name
+            # Write large initial log
+            f.write("[2026-09-15 09:00:00] [PROXY] POST req1 -> old@test.com (Status: 200)\n" * 10)
+            f.flush()
+            old_offset = f.tell()
+
+        try:
+            # Simulate log rotation / truncation: write a much smaller fresh log
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("[2026-09-15 10:00:00] [PROXY] POST req2 -> fresh@test.com (Status: 200)\n")
+
+            # Offset from previous large file exceeds new file size
+            delta = parse_log_delta(log_path, start_offset=old_offset)
+            self.assertTrue(delta.get("truncated"))
+            self.assertEqual(delta["dispatches"], ["fresh@test.com"])
+            self.assertEqual(len(delta["events"]), 1)
+        finally:
+            os.unlink(log_path)
+
+    def test_verify_max_quota_rounding_tie_break_hits(self):
+        accounts = [
+            {"email": "a@test.com", "quota": 0.854, "hits": 10, "is_eligible": True},
+            {"email": "b@test.com", "quota": 0.851, "hits": 5, "is_eligible": True},
+        ]
+        # Both round to 0.85; b has fewer hits (5 < 10), so b is chosen
+        res = verify_max_quota(["b@test.com"], accounts)
+        self.assertTrue(res["passed"])
+
+        res_fail = verify_max_quota(["a@test.com"], accounts)
+        self.assertFalse(res_fail["passed"])
+        self.assertIn("expected highest-quota candidate 'b@test.com'", res_fail["reason"])
+
+    def test_verify_max_quota_rounding_and_hits_tie_break_order(self):
+        accounts = [
+            {"id": "acc_1", "email": "a@test.com", "quota": 0.854, "hits": 5, "is_eligible": True},
+            {"id": "acc_2", "email": "b@test.com", "quota": 0.851, "hits": 5, "is_eligible": True},
+        ]
+        # Both round to 0.85 and have 5 hits; stable input order tie-breaks to acc_1 (a@test.com)
+        res = verify_max_quota(["a@test.com"], accounts)
+        self.assertTrue(res["passed"])
+
+        res_fail = verify_max_quota(["b@test.com"], accounts)
+        self.assertFalse(res_fail["passed"])
+
+    def test_verify_max_quota_excludes_cooldown_and_restricted(self):
+        accounts = [
+            {"email": "cooling@test.com", "quota": 1.0, "is_cooling": True, "is_eligible": False},
+            {"email": "restricted@test.com", "quota": 1.0, "status": "validation_required", "is_eligible": False},
+            {"email": "healthy@test.com", "quota": 0.40, "hits": 0, "is_eligible": True},
+        ]
+        # High quota cooling/restricted must be excluded; only healthy eligible account can be chosen
+        res = verify_max_quota(["healthy@test.com"], accounts)
+        self.assertTrue(res["passed"])
+
+        res_fail = verify_max_quota(["cooling@test.com"], accounts)
+        self.assertFalse(res_fail["passed"])
+
+    def test_verify_least_used_quota_and_id_tie_break(self):
+        accounts = [
+            {"id": "acc_1", "email": "a@test.com", "hits": 0, "quota": 0.40, "is_eligible": True},
+            {"id": "acc_2", "email": "b@test.com", "hits": 0, "quota": 0.80, "is_eligible": True},
+            {"id": "acc_3", "email": "c@test.com", "hits": 0, "quota": 0.80, "is_eligible": True},
+        ]
+        # Equal hits (0): higher quota tie-breaks between b (0.80) and a (0.40) -> b chosen
+        res_b = verify_least_used(["b@test.com"], accounts)
+        self.assertTrue(res_b["passed"])
+
+        res_a_fail = verify_least_used(["a@test.com"], accounts)
+        self.assertFalse(res_a_fail["passed"])
+        self.assertIn("had higher quota", res_a_fail["reason"])
+
+        # Equal hits (0) and equal quota (0.80): stable ID tie-breaks acc_2 before acc_3
+        res_c_fail = verify_least_used(["c@test.com"], accounts)
+        self.assertFalse(res_c_fail["passed"])
+        self.assertIn("expected ID 'acc_2'", res_c_fail["reason"])
+
+    def test_verify_least_used_multi_dispatch_per_invocation(self):
+        accounts = [
+            {"id": "acc_1", "email": "a@test.com", "hits": 0, "quota": 0.50, "is_eligible": True},
+            {"id": "acc_2", "email": "b@test.com", "hits": 3, "quota": 0.50, "is_eligible": True},
+        ]
+        # Simulates multiple internal dispatches to a@test.com before it reaches b's hits
+        dispatches = ["a@test.com", "a@test.com", "a@test.com", "a@test.com"]
+        res = verify_least_used(dispatches, accounts)
+        self.assertTrue(res["passed"])
+
+    def test_verify_round_robin_stale_or_removed_cursor(self):
+        accounts = [
+            {"id": "acc_1", "email": "a@test.com", "is_eligible": True},
+            {"id": "acc_2", "email": "b@test.com", "is_eligible": True},
+        ]
+        # When cursor refers to a removed account, production falls back to eligible[0] (a@test.com)
+        res = verify_round_robin(["a@test.com", "b@test.com"], accounts, initial_last_id="acc_deleted")
+        self.assertTrue(res["passed"])
+
+        res_fail = verify_round_robin(["b@test.com", "a@test.com"], accounts, initial_last_id="acc_deleted")
+        self.assertFalse(res_fail["passed"])
+        self.assertIn("stale cursor", res_fail["reason"])
+
+    def test_verify_round_robin_excludes_cooldown_accounts(self):
+        accounts = [
+            {"email": "a@test.com", "is_eligible": True},
+            {"email": "b@test.com", "is_cooling": True, "is_eligible": False},
+            {"email": "c@test.com", "is_eligible": True},
+        ]
+        # Rotation cycles only across eligible accounts [a, c]
+        res = verify_round_robin(["a@test.com", "c@test.com", "a@test.com"], accounts)
+        self.assertTrue(res["passed"])
+
+        res_fail = verify_round_robin(["a@test.com", "b@test.com"], accounts)
+        self.assertFalse(res_fail["passed"])
+        self.assertIn("not in eligible accounts", res_fail["reason"])
 
     def test_resolve_gateway_port(self):
         # Default
