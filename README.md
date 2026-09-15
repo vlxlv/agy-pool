@@ -1,6 +1,6 @@
 # agy-pool: Antigravity Multi-Account Quota Pool & Intelligent Load Balancer Suite
 
-[![Version](https://img.shields.io/badge/version-0.1.0--alpha9-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.0--alpha.9-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green.svg)](#)
 [![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](#)
