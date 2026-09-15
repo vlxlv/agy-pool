@@ -1945,6 +1945,39 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
     return eligible + depleted + cooldown + restricted
 
 
+def reserve_round_robin_candidates(now=None):
+    """
+    Atomically select candidate ordering and advance the persisted round_robin cursor
+    under pool_transaction() before upstream network dispatch begins.
+
+    Redefines the persisted cursor from 'last successfully completed account' to
+    'last account reserved/selected for a new generation dispatch' to prevent
+    concurrent generation handlers from reading an unadvanced cursor and selecting
+    the same account.
+    """
+    if now is None:
+        now = time.time()
+
+    def update(pool):
+        accounts = pool.get("accounts", [])
+        if not accounts:
+            return []
+        candidates = order_candidates(accounts, strategy="round_robin", pool=pool, now=now)
+        if candidates and candidates[0].get("id"):
+            pool["round_robin_last_account_id"] = candidates[0]["id"]
+        return [dict(a) for a in candidates]
+
+    return pool_transaction(update)
+
+
+def reserve_round_robin_account(now=None):
+    """
+    Atomically reserve and return the next round-robin account candidate.
+    """
+    candidates = reserve_round_robin_candidates(now=now)
+    return candidates[0] if candidates else None
+
+
 class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -2078,7 +2111,6 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
             if is_generation:
                 stored["gen_count"] = stored.get("gen_count", 0) + 1
                 stored["last_used_at"] = int(time.time())
-                pool["round_robin_last_account_id"] = stored["id"]
             if stored.get("status") in ("validation_required", "auth_error"):
                 stored.pop("status", None)
                 stored.pop("validation_url", None)
@@ -2155,7 +2187,10 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
         strategy = pool.get("strategy", "max_quota")
 
         if is_generation:
-            candidates = order_candidates(candidates, strategy=strategy, pool=pool, now=now)
+            if strategy == "round_robin":
+                candidates = reserve_round_robin_candidates(now=now)
+            else:
+                candidates = order_candidates(candidates, strategy=strategy, pool=pool, now=now)
         else:
             # Non-generation: prefer active account, deprioritize restricted/cooldown accounts
             active_id = pool.get("active_account_id")

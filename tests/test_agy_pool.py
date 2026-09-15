@@ -1143,6 +1143,166 @@ class AgyPoolTest(unittest.TestCase):
         self.assertEqual(body, b"res-d")
         self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "d")
 
+    def test_round_robin_concurrent_selection_prevents_duplicate_account(self):
+        acc1 = account("a")
+        acc2 = account("b")
+        acc3 = account("c")
+        self.save_accounts([acc1, acc2, acc3])
+        agy_pool.pool_transaction(lambda p: p.update(strategy="round_robin", round_robin_last_account_id="a"))
+
+        # Upstream coordination: hold both upstream handlers until both have arrived
+        barrier = threading.Barrier(2)
+        received_tokens = []
+        tokens_lock = threading.Lock()
+
+        def make_upstream_handler(token_name):
+            def handler(req_handler):
+                with tokens_lock:
+                    received_tokens.append(token_name)
+                barrier.wait(timeout=5)
+                req_handler.send_response(200)
+                req_handler.send_header("Content-Type", "text/event-stream")
+                req_handler.send_header("Connection", "close")
+                req_handler.end_headers()
+                req_handler.wfile.write(b"data: ok\n\n")
+            return handler
+
+        scenario = Scenario({
+            "token-b": [make_upstream_handler("token-b")],
+            "token-c": [make_upstream_handler("token-c")],
+        })
+        proxy = self.start_proxy(scenario)
+
+        results = []
+        def send_request():
+            st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+            results.append((st, body))
+
+        t1 = threading.Thread(target=send_request)
+        t2 = threading.Thread(target=send_request)
+        t1.start()
+        t2.start()
+        t1.join(timeout=6)
+        t2.join(timeout=6)
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(st == 200 for st, _ in results))
+
+        # Both concurrent requests must have selected distinct accounts: {token-b, token-c}
+        self.assertEqual(len(received_tokens), 2)
+        self.assertEqual(set(received_tokens), {"token-b", "token-c"})
+        # Persisted cursor must be 'c'
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "c")
+
+    def test_round_robin_out_of_order_completion_preserves_cursor(self):
+        acc1 = account("a")
+        acc2 = account("b")
+        acc3 = account("c")
+        self.save_accounts([acc1, acc2, acc3])
+        agy_pool.pool_transaction(lambda p: p.update(strategy="round_robin", round_robin_last_account_id="a"))
+
+        # Request 1 (reserving B) will be held until Request 2 (reserving C) has completely finished
+        b_arrived = threading.Event()
+        b_can_finish = threading.Event()
+
+        def b_handler(req_handler):
+            b_arrived.set()
+            b_can_finish.wait(timeout=5)
+            req_handler.send_response(200)
+            req_handler.send_header("Content-Length", "4")
+            req_handler.send_header("Connection", "close")
+            req_handler.end_headers()
+            req_handler.wfile.write(b"ok-b")
+
+        scenario = Scenario({
+            "token-b": [b_handler],
+            "token-c": [(200, b"ok-c", {})],
+        })
+        proxy = self.start_proxy(scenario)
+
+        results = {}
+        def run_req1():
+            st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+            results["req1"] = (st, body)
+
+        t1 = threading.Thread(target=run_req1)
+        t1.start()
+
+        # Wait until Request 1 has reserved B and arrived at upstream
+        self.assertTrue(b_arrived.wait(timeout=5))
+        # Cursor is now B
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "b")
+
+        # Now execute Request 2 synchronously. It reserves C, dispatches C, and finishes!
+        st2, body2, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual((st2, body2), (200, b"ok-c"))
+        # Request 2 completed, cursor is C
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "c")
+
+        # Now allow Request 1 (which reserved B) to finish later
+        b_can_finish.set()
+        t1.join(timeout=5)
+        self.assertEqual(results["req1"], (200, b"ok-b"))
+
+        # Late completion of B must NOT move cursor backward to B; cursor remains C
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "c")
+
+    def test_round_robin_failure_does_not_rollback_cursor(self):
+        acc1 = account("a")
+        acc2 = account("b")
+        acc3 = account("c")
+        self.save_accounts([acc1, acc2, acc3])
+        agy_pool.pool_transaction(lambda p: p.update(strategy="round_robin", round_robin_last_account_id="a"))
+
+        # B returns 500 (non-failover error)
+        scenario = Scenario({
+            "token-b": [(500, b"internal server error", {})],
+            "token-c": [(200, b"ok-c", {})],
+        })
+        proxy = self.start_proxy(scenario)
+
+        # Request 1 reserves B; upstream returns 500
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(st, 500)
+        self.assertEqual(body, b"internal server error")
+
+        # Cursor must NOT rollback to A; it remains B
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "b")
+
+        # Next independent RR request starts after B and chooses C
+        st2, body2, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(st2, 200)
+        self.assertEqual(body2, b"ok-c")
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "c")
+
+    def test_strategy_isolation_non_rr_does_not_mutate_rr_cursor(self):
+        acc1 = account("a")
+        acc1["last_quota"] = {"remaining_fraction": 0.9}
+        acc2 = account("b")
+        acc2["last_quota"] = {"remaining_fraction": 0.5}
+        self.save_accounts([acc1, acc2])
+        # Set an existing round_robin_last_account_id
+        agy_pool.pool_transaction(lambda p: p.update(strategy="max_quota", round_robin_last_account_id="existing_cursor"))
+
+        scenario = Scenario({
+            "token-a": [(200, b"res-a", {})],
+            "token-b": [(200, b"res-b", {})],
+        })
+        proxy = self.start_proxy(scenario)
+
+        # 1. max_quota dispatches to highest quota (a)
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(st, 200)
+        # Cursor must NOT be overwritten by max_quota
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "existing_cursor")
+
+        # 2. Switch to least_used
+        agy_pool.pool_transaction(lambda p: p.update(strategy="least_used"))
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(st, 200)
+        # Cursor must NOT be overwritten by least_used
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "existing_cursor")
+
     def test_retry_after_account_isolation(self):
         acc1 = account("a")
         acc2 = account("b")
