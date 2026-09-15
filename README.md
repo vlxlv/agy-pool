@@ -33,7 +33,7 @@ A zero-dependency multi-account quota pool and local reverse proxy for **Antigra
 ### Option A: Install from Standalone Tarball (Recommended)
 ```bash
 # Extract into your home directory
-tar -xzvf agy-pool-termux.tar.gz -C ~
+tar -xzvf agy-pool.tar.gz -C ~
 
 # Run the automated installer
 cd ~/agy-pool && bash install.sh

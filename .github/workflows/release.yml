@@ -27,7 +27,7 @@ jobs:
               --exclude='agy-pool/.github' \
               --exclude='agy-pool/__pycache__' \
               --exclude='*.pyc' \
-              -czvf agy-pool/dist/agy-pool-termux.tar.gz agy-pool
+              -czvf agy-pool/dist/agy-pool.tar.gz agy-pool
           cd agy-pool
           ls -lh dist/
 
@@ -65,4 +65,4 @@ jobs:
           body_path: release_notes.md
           prerelease: ${{ steps.check-prerelease.outputs.prerelease }}
           files: |
-            dist/agy-pool-termux.tar.gz
+            dist/agy-pool.tar.gz
