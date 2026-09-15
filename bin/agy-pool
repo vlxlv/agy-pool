@@ -46,6 +46,8 @@ QUOTA_FRESH_MAX_AGE = 60
 QUOTA_AGING_MAX_AGE = 300
 _QUOTA_REFRESH_LOCK = threading.Lock()
 _QUOTA_REFRESH_IN_FLIGHT = set()
+_QUOTA_REFRESH_RETRY = {}
+_QUOTA_REFRESH_BACKOFF = (30, 60, 120, 240, 300)
 def _decode_cred(h, k=0x5A):
     return bytes([b ^ k for b in bytes.fromhex(h)]).decode()
 
@@ -1906,21 +1908,46 @@ def quota_refresh_needed(account, now=None):
     return quota_freshness(account, now=now)["class"] != "fresh"
 
 
-def schedule_quota_refresh(account):
+def quota_freshness_rank(account, now=None):
+    """Rank freshness for scheduling; fresh and aging are equally trustworthy."""
+    return {"fresh": 2, "aging": 2, "stale": 1, "unknown": 0}[quota_freshness(account, now=now)["class"]]
+
+
+def schedule_quota_refresh(account, now=None):
     """Start one bounded, non-blocking refresh per account."""
     key = account.get("id") or account.get("email")
     if not key:
         return False
+    if now is None:
+        now = time.time()
     with _QUOTA_REFRESH_LOCK:
         if key in _QUOTA_REFRESH_IN_FLIGHT:
+            return False
+        retry = _QUOTA_REFRESH_RETRY.get(key)
+        if retry and retry["next_at"] > now:
             return False
         _QUOTA_REFRESH_IN_FLIGHT.add(key)
 
     def refresh():
         try:
-            _safe_quota(dict(account))
+            success = _safe_quota(dict(account))
+            with _QUOTA_REFRESH_LOCK:
+                if success:
+                    _QUOTA_REFRESH_RETRY.pop(key, None)
+                else:
+                    previous = _QUOTA_REFRESH_RETRY.get(key, {})
+                    attempt = previous.get("attempt", 0)
+                    delay = _QUOTA_REFRESH_BACKOFF[min(attempt, len(_QUOTA_REFRESH_BACKOFF) - 1)]
+                    _QUOTA_REFRESH_RETRY[key] = {
+                        "attempt": attempt + 1,
+                        "next_at": time.time() + delay,
+                    }
         except Exception:
-            pass
+            with _QUOTA_REFRESH_LOCK:
+                previous = _QUOTA_REFRESH_RETRY.get(key, {})
+                attempt = previous.get("attempt", 0)
+                delay = _QUOTA_REFRESH_BACKOFF[min(attempt, len(_QUOTA_REFRESH_BACKOFF) - 1)]
+                _QUOTA_REFRESH_RETRY[key] = {"attempt": attempt + 1, "next_at": time.time() + delay}
         finally:
             with _QUOTA_REFRESH_LOCK:
                 _QUOTA_REFRESH_IN_FLIGHT.discard(key)
@@ -2091,7 +2118,7 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
             return (
                 hits,
                 -cap["known_window_count"],
-                -quota_freshness(a, now=now)["rank"],
+                -quota_freshness_rank(a, now=now),
                 -cap["worst_pace"],
                 -cap["total_pace"],
                 -cap["raw_floor"],
@@ -2111,7 +2138,7 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
             hits = a.get("gen_count", a.get("request_count", 0))
             return (
                 cap["known_window_count"],
-                quota_freshness(a, now=now)["rank"],
+                quota_freshness_rank(a, now=now),
                 cap["worst_pace"],
                 cap["total_pace"],
                 cap["raw_floor"],

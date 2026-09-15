@@ -107,6 +107,8 @@ class AgyPoolTest(unittest.TestCase):
         agy_pool.AGY_CLI_DIR = os.path.join(gemini, "antigravity-cli")
         agy_pool.AGY_TOKEN_FILE = os.path.join(agy_pool.AGY_CLI_DIR, "antigravity-oauth-token")
         agy_pool.FILE_LOCKS.clear()
+        agy_pool._QUOTA_REFRESH_IN_FLIGHT.clear()
+        agy_pool._QUOTA_REFRESH_RETRY.clear()
         self.refresh_patch = mock.patch.object(agy_pool, "schedule_quota_refresh")
         self.refresh_mock = self.refresh_patch.start()
         self.addCleanup(self.refresh_patch.stop)
@@ -163,6 +165,75 @@ class AgyPoolTest(unittest.TestCase):
         self.assertEqual(agy_pool.quota_freshness(snapshot(now - 600), now)["class"], "stale")
         self.assertEqual(agy_pool.quota_freshness({"last_quota": {}}, now)["class"], "unknown")
         self.assertEqual(agy_pool.quota_freshness(snapshot(now - 1, now - 1), now)["class"], "stale")
+
+    def test_refresh_failure_uses_bounded_backoff_and_success_resets(self):
+        self.refresh_patch.stop()
+        acc = account("retry")
+        acc["last_quota"] = {"updated_at": 1, "gemini_5h": {"fraction": 0.7}}
+        calls = []
+        def fail(_):
+            calls.append(1)
+        with mock.patch.object(agy_pool, "_safe_quota", side_effect=fail):
+            self.assertTrue(agy_pool.schedule_quota_refresh(acc, now=1000))
+            for _ in range(20):
+                if not agy_pool._QUOTA_REFRESH_IN_FLIGHT:
+                    break
+                time.sleep(0.01)
+            self.assertFalse(agy_pool.schedule_quota_refresh(acc, now=1001))
+            retry = agy_pool._QUOTA_REFRESH_RETRY["retry"]
+            self.assertGreaterEqual(retry["next_at"], time.time() + 29)
+            self.assertLessEqual(retry["next_at"], time.time() + 31)
+            self.assertEqual(len(calls), 1)
+        # Exhaust the sequence deterministically without sleeping.
+        for expected in (60, 120, 240, 300, 300):
+            retry["next_at"] = 0
+            with mock.patch.object(agy_pool, "_safe_quota", return_value=False):
+                self.assertTrue(agy_pool.schedule_quota_refresh(acc, now=2000))
+            for _ in range(20):
+                if not agy_pool._QUOTA_REFRESH_IN_FLIGHT:
+                    break
+                time.sleep(0.01)
+            retry = agy_pool._QUOTA_REFRESH_RETRY["retry"]
+            self.assertLessEqual(abs((retry["next_at"] - time.time()) - expected), 1)
+        retry["next_at"] = 0
+        with mock.patch.object(agy_pool, "_safe_quota", return_value=True):
+            self.assertTrue(agy_pool.schedule_quota_refresh(acc, now=3000))
+        for _ in range(20):
+            if not agy_pool._QUOTA_REFRESH_IN_FLIGHT:
+                break
+            time.sleep(0.01)
+        self.assertNotIn("retry", agy_pool._QUOTA_REFRESH_RETRY)
+
+    def test_fresh_and_aging_capacity_order_by_capacity(self):
+        now = time.time()
+        low = account("low")
+        low["last_quota"] = {"updated_at": now - 30, "gemini_5h": {"fraction": 0.20}, "gemini_weekly": {"fraction": 0.20}}
+        high = account("high")
+        high["last_quota"] = {"updated_at": now - 61, "gemini_5h": {"fraction": 0.90}, "gemini_weekly": {"fraction": 0.90}}
+        ordered = agy_pool.order_candidates([low, high], now=now)
+        self.assertEqual(ordered[0]["id"], "high")
+
+    def test_fresh_and_aging_equal_capacity_use_existing_ties(self):
+        now = time.time()
+        accounts = []
+        for account_id, age in (("first", 30), ("second", 61)):
+            acc = account(account_id)
+            acc["last_quota"] = {"updated_at": now - age, "gemini_5h": {"fraction": 0.8}, "gemini_weekly": {"fraction": 0.8}}
+            accounts.append(acc)
+        self.assertEqual(agy_pool.order_candidates(accounts, now=now)[0]["id"], "first")
+
+    def test_stale_is_below_fresh_and_unknown_is_lowest_freshness(self):
+        now = time.time()
+        def make(account_id, updated):
+            acc = account(account_id)
+            acc["last_quota"] = {"updated_at": updated, "gemini_5h": {"fraction": 0.8}, "gemini_weekly": {"fraction": 0.8}}
+            return acc
+        fresh = make("fresh", now - 30)
+        stale = make("stale", now - 600)
+        unknown = make("unknown", None)
+        unknown["last_quota"].pop("updated_at")
+        ordered = agy_pool.order_candidates([unknown, stale, fresh], now=now)
+        self.assertEqual([a["id"] for a in ordered], ["fresh", "stale", "unknown"])
 
     def test_stale_refresh_is_single_flight(self):
         self.refresh_patch.stop()
