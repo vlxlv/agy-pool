@@ -2039,8 +2039,8 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
       4. Restricted accounts: validation_required or auth_error.
 
     Strategies applied strictly to the eligible account set:
-      - max_quota: Prioritizes accounts with safest remaining 5-hour and weekly capacity (taking reset
-        times into account, binned by 0.01), breaking ties by total pace, raw floor, and lowest hits.
+      - max_quota: Prioritizes accounts with safest remaining 5-hour and weekly capacity (worst_pace,
+        total_pace, raw_floor descending at full precision), breaking ties by lowest Hits.
       - least_used: Lowest generation count (Hits), breaking ties by reset-aware capacity pace,
         raw quota floor, then account ID.
       - round_robin: Sequential rotation starting after round_robin_last_account_id, wrapping around.
@@ -2078,9 +2078,9 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
             hits = a.get("gen_count", a.get("request_count", 0))
             return (
                 hits,
-                -round(cap["worst_pace"], 2),
-                -round(cap["total_pace"], 2),
-                -round(cap["raw_floor"], 2),
+                -cap["worst_pace"],
+                -cap["total_pace"],
+                -cap["raw_floor"],
                 a.get("id", "")
             )
         eligible.sort(key=_least_used_key)
@@ -2096,16 +2096,16 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
             cap = compute_capacity_state(a, now=now)
             hits = a.get("gen_count", a.get("request_count", 0))
             return (
-                round(cap["worst_pace"], 2),
-                -hits,
-                round(cap["total_pace"], 2),
-                round(cap["raw_floor"], 2)
+                cap["worst_pace"],
+                cap["total_pace"],
+                cap["raw_floor"],
+                -hits
             )
         eligible.sort(key=_max_quota_key, reverse=True)
 
     # Secondary tiers ordering
     depleted.sort(key=lambda a: (
-        round(compute_capacity_state(a, now=now)["raw_floor"], 2),
+        compute_capacity_state(a, now=now)["raw_floor"],
         -a.get("gen_count", a.get("request_count", 0))
     ), reverse=True)
 

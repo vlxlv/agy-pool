@@ -345,24 +345,36 @@ Refreshing quota for 1 account(s)...
             os.unlink(log_path)
 
     def test_verify_max_quota_rounding_tie_break_hits(self):
-        accounts = [
+        # 1. Full precision capacity beats hits: 0.854 > 0.851 even though b has fewer hits (5 < 10)
+        accounts_diff = [
             {"email": "a@test.com", "quota": 0.854, "hits": 10, "is_eligible": True},
             {"email": "b@test.com", "quota": 0.851, "hits": 5, "is_eligible": True},
         ]
-        # Both round to 0.85; b has fewer hits (5 < 10), so b is chosen
-        res = verify_max_quota(["b@test.com"], accounts)
-        self.assertTrue(res["passed"])
+        res_a = verify_max_quota(["a@test.com"], accounts_diff)
+        self.assertTrue(res_a["passed"])
 
-        res_fail = verify_max_quota(["a@test.com"], accounts)
-        self.assertFalse(res_fail["passed"])
-        self.assertIn("expected highest-quota candidate 'b@test.com'", res_fail["reason"])
+        res_b_fail = verify_max_quota(["b@test.com"], accounts_diff)
+        self.assertFalse(res_b_fail["passed"])
+        self.assertIn("expected highest-quota candidate 'a@test.com'", res_b_fail["reason"])
+
+        # 2. Equal capacity tie-breaks by lowest Hits: 5 < 10 -> b chosen
+        accounts_equal = [
+            {"email": "a@test.com", "quota": 0.850, "hits": 10, "is_eligible": True},
+            {"email": "b@test.com", "quota": 0.850, "hits": 5, "is_eligible": True},
+        ]
+        res_b = verify_max_quota(["b@test.com"], accounts_equal)
+        self.assertTrue(res_b["passed"])
+
+        res_a_fail = verify_max_quota(["a@test.com"], accounts_equal)
+        self.assertFalse(res_a_fail["passed"])
+        self.assertIn("expected highest-quota candidate 'b@test.com'", res_a_fail["reason"])
 
     def test_verify_max_quota_rounding_and_hits_tie_break_order(self):
         accounts = [
-            {"id": "acc_1", "email": "a@test.com", "quota": 0.854, "hits": 5, "is_eligible": True},
-            {"id": "acc_2", "email": "b@test.com", "quota": 0.851, "hits": 5, "is_eligible": True},
+            {"id": "acc_1", "email": "a@test.com", "quota": 0.850, "hits": 5, "is_eligible": True},
+            {"id": "acc_2", "email": "b@test.com", "quota": 0.850, "hits": 5, "is_eligible": True},
         ]
-        # Both round to 0.85 and have 5 hits; stable input order tie-breaks to acc_1 (a@test.com)
+        # Equal capacity (0.850) and equal hits (5); stable input order tie-breaks to acc_1 (a@test.com)
         res = verify_max_quota(["a@test.com"], accounts)
         self.assertTrue(res["passed"])
 

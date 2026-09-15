@@ -1635,6 +1635,104 @@ class AgyPoolTest(unittest.TestCase):
         ordered = agy_pool.order_candidates([acc_low_cap, acc_high_cap], strategy="least_used", now=now)
         self.assertEqual([x["id"] for x in ordered], ["high_cap", "low_cap"])
 
+    def test_max_quota_full_precision_beats_hits(self):
+        now = 1726400000.0
+        # A: worst_pace = 0.014, hits = 100
+        # B: worst_pace = 0.011, hits = 0
+        # 5h window: W5 = 18000s, reset at now + 9000 (r5 = 0.5)
+        # weekly window: W7 = 604800s, reset at now + 302400 (r7 = 0.5)
+        acc_a = account("acc_a")
+        acc_a["gen_count"] = 100
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.514, "reset_time": now + 9000},
+            "gemini_weekly": {"fraction": 0.514, "reset_time": now + 302400},
+        }
+        acc_b = account("acc_b")
+        acc_b["gen_count"] = 0
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.511, "reset_time": now + 9000},
+            "gemini_weekly": {"fraction": 0.511, "reset_time": now + 302400},
+        }
+        # A has worst_pace 0.014 > B's 0.011; full precision must not round to 0.01 and let Hits decide
+        ordered = agy_pool.order_candidates([acc_b, acc_a], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_a", "acc_b"])
+
+    def test_max_quota_total_pace_beats_hits(self):
+        now = 1726400000.0
+        # A: worst_pace = 0.10, total_pace = 0.40, hits = 100
+        # B: worst_pace = 0.10, total_pace = 0.20, hits = 0
+        acc_a = account("acc_a")
+        acc_a["gen_count"] = 100
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.60, "reset_time": now + 9000},       # pace5 = 0.60 - 0.50 = 0.10
+            "gemini_weekly": {"fraction": 0.80, "reset_time": now + 302400}, # pace7 = 0.80 - 0.50 = 0.30
+        }
+        acc_b = account("acc_b")
+        acc_b["gen_count"] = 0
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.60, "reset_time": now + 9000},       # pace5 = 0.60 - 0.50 = 0.10
+            "gemini_weekly": {"fraction": 0.60, "reset_time": now + 302400}, # pace7 = 0.60 - 0.50 = 0.10
+        }
+        # Equal worst_pace (0.10), A has higher total_pace (0.40 > 0.20); must evaluate before Hits
+        ordered = agy_pool.order_candidates([acc_b, acc_a], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_a", "acc_b"])
+
+    def test_max_quota_raw_floor_beats_hits(self):
+        now = 1726400000.0
+        # A: worst_pace = 0.25, total_pace = 0.50, raw_floor = 0.75, hits = 50
+        # B: worst_pace = 0.25, total_pace = 0.50, raw_floor = 0.50, hits = 0
+        # Using exact dyadic fractions (powers of 2) for zero floating-point representation error:
+        acc_a = account("acc_a")
+        acc_a["gen_count"] = 50
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.75, "reset_time": now + 9000},       # r5 = 0.50 -> pace5 = 0.25
+            "gemini_weekly": {"fraction": 0.75, "reset_time": now + 302400}, # r7 = 0.50 -> pace7 = 0.25
+        }
+        acc_b = account("acc_b")
+        acc_b["gen_count"] = 0
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.50, "reset_time": now + 4500},       # r5 = 0.25 -> pace5 = 0.25
+            "gemini_weekly": {"fraction": 0.875, "reset_time": now + 378000},# r7 = 0.625 -> pace7 = 0.25
+        }
+        # Equal worst_pace (0.25) and total_pace (0.50); A has higher raw_floor (0.75 > 0.50); must evaluate before Hits
+        ordered = agy_pool.order_candidates([acc_b, acc_a], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_a", "acc_b"])
+
+    def test_max_quota_hits_remains_final_capacity_tie_break(self):
+        now = 1726400000.0
+        acc_a = account("acc_a")
+        acc_a["gen_count"] = 25
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.70, "reset_time": now + 9000},
+            "gemini_weekly": {"fraction": 0.70, "reset_time": now + 302400},
+        }
+        acc_b = account("acc_b")
+        acc_b["gen_count"] = 5
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.70, "reset_time": now + 9000},
+            "gemini_weekly": {"fraction": 0.70, "reset_time": now + 302400},
+        }
+        # Identical capacity metrics: lower Hits (acc_b with 5 < 25) must rank first
+        ordered = agy_pool.order_candidates([acc_a, acc_b], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_b", "acc_a"])
+
+    def test_max_quota_exact_full_tie_preserves_stable_order(self):
+        now = 1726400000.0
+        acc_1 = account("first")
+        acc_1["gen_count"] = 10
+        acc_1["last_quota"] = {"remaining_fraction": 0.85}
+        acc_2 = account("second")
+        acc_2["gen_count"] = 10
+        acc_2["last_quota"] = {"remaining_fraction": 0.85}
+
+        # Original order [first, second] preserved
+        ordered_1 = agy_pool.order_candidates([acc_1, acc_2], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered_1], ["first", "second"])
+
+        # Original order [second, first] preserved
+        ordered_2 = agy_pool.order_candidates([acc_2, acc_1], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered_2], ["second", "first"])
+
 
 if __name__ == "__main__":
     unittest.main()

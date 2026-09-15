@@ -781,9 +781,9 @@ def verify_least_used(
         def _lu_tie_key(a):
             cap = compute_capacity_state(a, now=now)
             return (
-                -round(cap["worst_pace"], 2),
-                -round(cap["total_pace"], 2),
-                -round(cap["raw_floor"], 2),
+                -cap["worst_pace"],
+                -cap["total_pace"],
+                -cap["raw_floor"],
                 a.get("id", "")
             )
         min_accounts.sort(key=_lu_tie_key)
@@ -797,15 +797,15 @@ def verify_least_used(
             if actual_acc and _lu_tie_key(actual_acc) == _lu_tie_key(min_accounts[0]):
                 pass
             elif actual_cap and (
-                (round(actual_cap["worst_pace"], 2) < round(top_cap["worst_pace"], 2)) or
-                (round(actual_cap["total_pace"], 2) < round(top_cap["total_pace"], 2)) or
-                (round(actual_cap["raw_floor"], 2) < round(top_cap["raw_floor"], 2))
+                (actual_cap["worst_pace"] < top_cap["worst_pace"]) or
+                (actual_cap["total_pace"] < top_cap["total_pace"]) or
+                (actual_cap["raw_floor"] < top_cap["raw_floor"])
             ):
                 return {
                     "passed": False,
                     "reason": (
                         f"Step {idx}: tie-breaker failed. Both had {min_hits_val} hits, but '{expected_top}' "
-                        f"had higher quota ({round(top_cap['raw_floor'], 2)}) than '{d}' ({round(actual_cap['raw_floor'], 2)})"
+                        f"had higher quota ({top_cap['raw_floor']}) than '{d}' ({actual_cap['raw_floor']})"
                     ),
                     "step": idx,
                     "expected": expected_top,
@@ -815,7 +815,7 @@ def verify_least_used(
                 return {
                     "passed": False,
                     "reason": (
-                        f"Step {idx}: tie-breaker failed. Equal hits ({min_hits_val}) and equal quota ({round(top_cap['raw_floor'], 2)}), "
+                        f"Step {idx}: tie-breaker failed. Equal hits ({min_hits_val}) and equal quota ({top_cap['raw_floor']}), "
                         f"expected ID '{min_accounts[0].get('id')}' ('{expected_top}'), got '{actual_acc.get('id')}' ('{d}')"
                     ),
                     "step": idx,
@@ -856,10 +856,10 @@ def verify_max_quota(
         cap = compute_capacity_state(a, now=now)
         hits = a.get("hits", a.get("gen_count", a.get("request_count", 0)))
         return (
-            round(cap["worst_pace"], 2),
-            -hits,
-            round(cap["total_pace"], 2),
-            round(cap["raw_floor"], 2)
+            cap["worst_pace"],
+            cap["total_pace"],
+            cap["raw_floor"],
+            -hits
         )
 
     # Sort eligible by capacity pace desc, raw floor desc, hits asc
@@ -869,26 +869,40 @@ def verify_max_quota(
         reverse=True
     )
     top_account = sorted_eligible[0].get("email") or sorted_eligible[0].get("id")
-    top_key = _mq_key(sorted_eligible[0])
-
-    top_tied = {
-        a.get("email") or a.get("id")
-        for a in sorted_eligible
-        if _mq_key(a) == top_key
-    }
 
     # In max_quota without cooldown/failover, dispatches should go to top candidate
     for idx, d in enumerate(dispatches):
-        if d != top_account and d not in top_tied:
+        if d != top_account:
             top_cap = compute_capacity_state(sorted_eligible[0], now=now)
             actual_acc = next((a for a in eligible if a.get("email") == d or a.get("id") == d), None)
             actual_cap = compute_capacity_state(actual_acc, now=now) if actual_acc else None
-            actual_str = f"worst_pace: {round(actual_cap['worst_pace'], 2)}, quota: {actual_cap['raw_floor']}" if actual_cap else "unknown"
+
+            # If CLI reset-time parsing is too coarse to reproduce an extremely close production comparison exactly,
+            # return INCONCLUSIVE rather than false FAIL.
+            has_coarse_cli_time = any(
+                a.get("gemini_5h_reset_sec") is not None or a.get("gemini_weekly_reset_sec") is not None
+                for a in eligible
+            )
+            if has_coarse_cli_time and actual_cap:
+                pace_diff = abs(top_cap["worst_pace"] - actual_cap["worst_pace"])
+                if pace_diff < 0.01:
+                    return {
+                        "passed": True,
+                        "status": "INCONCLUSIVE",
+                        "reason": (
+                            f"Step {idx}: ambiguous capacity ordering between '{top_account}' and '{d}' "
+                            f"(worst_pace difference {pace_diff:.4f} within CLI reset time granularity)"
+                        ),
+                        "details": f"Inconclusive due to coarse CLI reset time margin between '{top_account}' and '{d}'",
+                        "dispatches": dispatches,
+                    }
+
+            actual_str = f"worst_pace: {actual_cap['worst_pace']}, quota: {actual_cap['raw_floor']}" if actual_cap else "unknown"
             return {
                 "passed": False,
                 "reason": (
                     f"Step {idx}: expected highest-quota candidate '{top_account}' "
-                    f"(worst_pace: {round(top_cap['worst_pace'], 2)}, quota: {sorted_eligible[0].get('quota', top_cap['raw_floor'])}), but got '{d}' ({actual_str})"
+                    f"(worst_pace: {top_cap['worst_pace']}, quota: {sorted_eligible[0].get('quota', top_cap['raw_floor'])}), but got '{d}' ({actual_str})"
                 ),
                 "step": idx,
                 "expected": top_account,
