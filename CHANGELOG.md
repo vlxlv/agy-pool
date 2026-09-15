@@ -5,6 +5,27 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha.10] - 2026-09-15
+
+### Added
+- Reset-aware quota capacity scoring using both 5-hour and weekly reset horizons.
+- Live scheduler validation harness (`scripts/live-test.sh`, `scripts/live_test.py`) for gateway routing and concurrency verification.
+- Comprehensive offline parser and verifier regression coverage for multidispatch, auxiliary traffic, and rotation handling.
+
+### Changed
+- `max_quota` now prioritizes reset-aware usable headroom (`worst_pace`, `total_pace`, `raw_floor`, full float precision) rather than static quota percentage alone.
+- `least_used` uses reset-aware capacity as tie-break information while maintaining Hits-first primary ordering.
+- Round-robin cursor semantics changed to atomic reservation-at-selection within the pool transaction.
+- Live scheduler reporting distinguishes internal multidispatch and generation failover from external concurrency.
+
+### Fixed
+- Prevented duplicate account selection under concurrent generation requests in `round_robin`.
+- Eliminated premature quota score rounding and unintended over-weighting of Hits in `max_quota`.
+- Corrected auxiliary gateway traffic misclassification in live scheduler tests.
+- Handled log rotation and truncation safely during live-test delta parsing.
+- Corrected installer and uninstaller script executable modes (`100755`).
+- Removed redundant `agy-raw` shell self-alias.
+
 ## [0.1.0-alpha.9] - 2026-09-15
 
 ### Added

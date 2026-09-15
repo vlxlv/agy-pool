@@ -1,6 +1,6 @@
 # agy-pool: Antigravity Multi-Account Quota Pool & Intelligent Load Balancer Suite
 
-[![Version](https://img.shields.io/badge/version-0.1.0--alpha.9-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.0--alpha.10-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green.svg)](#)
 [![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](#)
@@ -81,7 +81,7 @@ The installer automatically validates the Python 3 runtime, installs global syml
 | `agy-pool remove <ID/Email>` | e.g. `remove 2` | Remove account from pool |
 
 > **Load balancing strategies**:
-> - `max_quota` (default): Prioritizes accounts with the safest remaining 5-hour and weekly quota, taking each reset time into account.
+> - `max_quota` (default): Prioritizes accounts with the safest usable 5-hour and weekly quota headroom, taking both reset times into account.
 > - `least_used`: Distributes load evenly to accounts with lowest AI generation count (Hits).
 > - `round_robin`: Cycles through ready accounts in sequential rotation.
 
@@ -173,7 +173,7 @@ Each proxied HTTP request uses the account selected by the gateway and its reque
 `agy-pool` includes a dedicated live integration smoke-test harness (`scripts/live-test.sh`) to validate gateway routing, process concurrency, and scheduler rotation on real Linux/VPS environments with native `agy` and live Google accounts.
 
 > [!IMPORTANT]
-> Real live tests are manual-only and consume real account quota. They are never executed by GitHub Actions.
+> Real live tests are manual-only. They consume real account quota. They are never executed automatically by GitHub Actions.
 
 ### Manual Live Testing (Over SSH)
 
