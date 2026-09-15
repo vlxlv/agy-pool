@@ -670,13 +670,19 @@ Refreshing quota for 1 account(s)...
             self.assertEqual(delta["generation_dispatches"], ["a@test.com", "unrelated@test.com"])
             self.assertEqual(len(delta["failovers"]), 0)
 
-            # Uncorrelated extra generation traffic must evaluate to INCONCLUSIVE (not CLEAN / false PASS)
+            # Extra generation traffic without external marker evaluates to INTERNAL_MULTIDISPATCH
             hits_delta = {"total_delta": 2, "gcd": 1}
             conc = detect_concurrent_activity(1, delta["generation_dispatches"], hits_delta, failovers=delta["failovers"])
-            self.assertEqual(conc["status"], "INCONCLUSIVE")
+            self.assertEqual(conc["status"], "INTERNAL_MULTIDISPATCH")
             self.assertTrue(conc["is_inconclusive"])
             self.assertFalse(conc["concurrent_detected"])
-            self.assertIn("concurrent generation traffic", conc["message"].lower())
+            self.assertIn("internal multi-generation behavior", conc["message"].lower())
+            self.assertNotIn("external pool traffic detected", conc["message"].lower())
+
+            # When independent external signal is confirmed, evaluates to CONCURRENT
+            conc_ext = detect_concurrent_activity(1, delta["generation_dispatches"], hits_delta, failovers=delta["failovers"], external_detected=True)
+            self.assertEqual(conc_ext["status"], "CONCURRENT")
+            self.assertTrue(conc_ext["concurrent_detected"])
         finally:
             os.unlink(log_path)
 
@@ -753,6 +759,71 @@ Refreshing quota for 1 account(s)...
             )
         finally:
             os.unlink(delta_path)
+
+    def test_traffic_classification_case1_clean(self):
+        """Case 1: 1 outer invocation, 1 generation dispatch -> CLEAN"""
+        conc = detect_concurrent_activity(1, ["zhangy0623@gmail.com"], {"total_delta": 1, "gcd": 1})
+        self.assertEqual(conc["status"], "CLEAN")
+        self.assertFalse(conc["concurrent_detected"])
+        self.assertFalse(conc["is_inconclusive"])
+
+    def test_traffic_classification_case2_internal_multidispatch(self):
+        """
+        Case 2: 1 outer invocation, 2 generation dispatches, no explicit external marker/evidence
+        -> Expected: INTERNAL_MULTIDISPATCH (must NOT be CONCURRENT).
+        """
+        dispatches = ["pixelzen32@gmail.com", "pixelzen32@gmail.com"]
+        hits_delta = {"total_delta": 2, "gcd": 2}
+        conc = detect_concurrent_activity(1, dispatches, hits_delta)
+        self.assertEqual(conc["status"], "INTERNAL_MULTIDISPATCH")
+        self.assertFalse(conc["concurrent_detected"], "Must NOT be flagged as CONCURRENT")
+        self.assertTrue(conc["is_inconclusive"])
+        self.assertIn("1 outer agy invocation produced 2 generation dispatches", conc["message"])
+        self.assertIn("internal multi-generation behavior", conc["message"])
+        self.assertNotIn("external pool traffic detected", conc["message"].lower())
+
+    def test_traffic_classification_case3_nine_runs_ten_dispatches_not_concurrent(self):
+        """Case 3: 9 outer invocations, 10 generation dispatches -> not automatically CONCURRENT"""
+        dispatches = ["a@example.com"] * 10
+        hits_delta = {"total_delta": 10, "gcd": 1}
+        conc = detect_concurrent_activity(9, dispatches, hits_delta)
+        self.assertNotEqual(conc["status"], "CONCURRENT")
+        self.assertFalse(conc["concurrent_detected"], "10 dispatches for 9 runs must not be flagged CONCURRENT")
+
+    def test_traffic_classification_case4_independent_external_traffic_concurrent(self):
+        """Case 4: Clearly unrelated generation traffic that can be identified independently -> CONCURRENT"""
+        # Scenario A: Explicit independent signal
+        conc_signal = detect_concurrent_activity(
+            1,
+            ["a@example.com", "unrelated@external.com"],
+            {"total_delta": 2, "gcd": 1},
+            external_detected=True
+        )
+        self.assertEqual(conc_signal["status"], "CONCURRENT")
+        self.assertTrue(conc_signal["concurrent_detected"])
+        self.assertFalse(conc_signal["is_inconclusive"])
+
+        # Scenario B: Massive disproportionate traffic volume (e.g. 10 dispatches for 1 expected run)
+        conc_volume = detect_concurrent_activity(
+            1,
+            ["a@example.com"] * 10,
+            {"total_delta": 10, "gcd": 1}
+        )
+        self.assertEqual(conc_volume["status"], "CONCURRENT")
+        self.assertTrue(conc_volume["concurrent_detected"])
+
+    def test_traffic_classification_case5_generation_failover_not_concurrent(self):
+        """
+        Case 5: Generation failover (account A fails, FAILOVER, account B succeeds)
+        -> recognized as one test request with failover behavior; not automatically external concurrency.
+        """
+        failovers = [{"account": "a@example.com", "reason": "rate limit/quota error"}]
+        dispatches = ["b@example.com"]
+        hits_delta = {"total_delta": 1, "gcd": 1}
+        conc = detect_concurrent_activity(1, dispatches, hits_delta, failovers=failovers)
+        self.assertEqual(conc["status"], "CLEAN")
+        self.assertFalse(conc["concurrent_detected"], "Failover must not be flagged as external concurrency")
+        self.assertFalse(conc["is_inconclusive"])
 
 
 if __name__ == "__main__":

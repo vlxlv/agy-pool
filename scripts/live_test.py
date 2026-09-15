@@ -692,33 +692,40 @@ def detect_concurrent_activity(
     hits_delta: Dict[str, Any],
     tolerance_ratio: float = 2.0,
     failovers: Optional[List[Any]] = None,
+    external_detected: bool = False,
 ) -> Dict[str, Any]:
     """
     Detect whether external concurrent generation requests were processed by the pool during the test.
     Auxiliary requests (metadata, config, session, auth, quota) are excluded from this check.
 
-    - For expected_runs == 1: Exactly 1 generation dispatch is expected (unless accounted failovers occur).
-      Any extra unexplained generation dispatch evaluates to INCONCLUSIVE.
-    - For expected_runs > 1: Nominal slack of +1 dispatch accounts for internal sub-dispatch / continuation.
-    - Intermediate excess traffic (exceeding nominal slack but <= tolerance_ratio) evaluates to INCONCLUSIVE.
-    - Severe excess traffic exceeding tolerance_ratio evaluates to CONCURRENT.
+    Classifications:
+    - CLEAN: Observed generation activity is fully consistent with the requested live test and no unexplained
+      generation traffic exists.
+    - INTERNAL_MULTIDISPATCH: One or more outer test invocations legitimately produce multiple generation
+      dispatches consistent with internal agy behavior (e.g. 1 outer run -> 2 generation dispatches).
+      Does not claim external concurrency.
+    - INCONCLUSIVE: Extra generation activity exists beyond nominal multi-dispatch slack, but cannot prove
+      external traffic vs internal agy behavior / retries / failovers.
+    - CONCURRENT: Strong evidence indicates unrelated external generation traffic (explicit external signal or
+      severe volume far exceeding any internal multi-dispatch).
     """
     observed_dispatches = len(dispatches)
     total_delta = hits_delta.get("total_delta", 0)
     gcd_val = hits_delta.get("gcd", 1) or 1
     failover_count = len(failovers) if isinstance(failovers, list) else int(failovers or 0)
 
-    # For expected_runs == 1, exactly 1 generation dispatch is expected.
-    # For expected_runs > 1, allow nominal slack of +1 for potential sub-dispatch.
-    minor_slack_dispatches = expected_runs if expected_runs <= 1 else (expected_runs + 1)
-    minor_slack_hits = (minor_slack_dispatches + failover_count) * gcd_val
-
-    # Hard threshold beyond which external traffic is confirmed
-    hard_max_dispatches = max(expected_runs + 2, int(math.ceil(expected_runs * tolerance_ratio)))
+    # Hard threshold beyond which external traffic is confirmed by volume
+    hard_max_dispatches = max(expected_runs + 2 + failover_count,
+                              int(math.ceil(expected_runs * tolerance_ratio + failover_count)))
     hard_max_hits = max((expected_runs + 2 + failover_count) * gcd_val,
                          int(math.ceil((expected_runs * tolerance_ratio + failover_count) * gcd_val)))
 
-    if observed_dispatches > hard_max_dispatches or total_delta > hard_max_hits:
+    if external_detected:
+        status = "CONCURRENT"
+        concurrent_detected = True
+        is_inconclusive = False
+        message = "Confirmed concurrent external traffic: independent external generation traffic identified"
+    elif observed_dispatches > hard_max_dispatches or total_delta > hard_max_hits:
         status = "CONCURRENT"
         concurrent_detected = True
         is_inconclusive = False
@@ -726,19 +733,38 @@ def detect_concurrent_activity(
             f"Confirmed concurrent external traffic: observed {observed_dispatches} generation dispatches "
             f"(expected <= {hard_max_dispatches}) or +{total_delta} Hits (expected <= {hard_max_hits})"
         )
-    elif observed_dispatches > minor_slack_dispatches or total_delta > minor_slack_hits:
-        status = "INCONCLUSIVE"
+    elif expected_runs == 1 and observed_dispatches == 2 + failover_count:
+        # 1 outer invocation producing 2 generation dispatches is consistent with internal agy multi-dispatch
+        status = "INTERNAL_MULTIDISPATCH"
         concurrent_detected = False
         is_inconclusive = True
         message = (
-            f"Possible concurrent generation traffic / ambiguous excess requests: observed {observed_dispatches} "
-            f"generation dispatches for {expected_runs} expected run(s)"
+            f"1 outer agy invocation produced {observed_dispatches} generation dispatches. "
+            f"This is consistent with internal multi-generation behavior. "
+            f"External concurrent traffic is not proven."
         )
     else:
-        status = "CLEAN"
-        concurrent_detected = False
-        is_inconclusive = False
-        message = "No concurrent external traffic detected"
+        # Baseline check for clean single- or multi-run executions
+        # For expected_runs == 1: exactly 1 generation dispatch expected (plus failovers)
+        # For expected_runs > 1: allow nominal slack of +1 for potential sub-dispatch
+        minor_slack_dispatches = expected_runs + failover_count if expected_runs <= 1 else (expected_runs + 1 + failover_count)
+        minor_slack_hits = minor_slack_dispatches * gcd_val
+
+        if observed_dispatches > minor_slack_dispatches or total_delta > minor_slack_hits:
+            status = "INCONCLUSIVE"
+            concurrent_detected = False
+            is_inconclusive = True
+            message = (
+                f"Ambiguous generation traffic: observed {observed_dispatches} "
+                f"generation dispatches for {expected_runs} expected run(s). "
+                f"The additional generation may be internal to agy. "
+                f"External traffic is not proven."
+            )
+        else:
+            status = "CLEAN"
+            concurrent_detected = False
+            is_inconclusive = False
+            message = "No concurrent external traffic detected"
 
     return {
         "concurrent_detected": concurrent_detected,
@@ -821,6 +847,7 @@ def main():
     dc_p.add_argument("--dispatches", required=True, help="JSON list of dispatched accounts or file")
     dc_p.add_argument("--hits-delta", required=True, help="Hits delta JSON or file")
     dc_p.add_argument("--failovers", default=None, help="Failovers JSON list or file (optional)")
+    dc_p.add_argument("--external-detected", action="store_true", default=False, help="Flag if external traffic is independently confirmed")
 
     args = parser.parse_args()
 
@@ -887,7 +914,11 @@ def main():
             except Exception:
                 failovers = None
 
-        res = detect_concurrent_activity(args.expected, dispatches, hits_delta, failovers=failovers)
+        external_detected = bool(getattr(args, "external_detected", False))
+        res = detect_concurrent_activity(
+            args.expected, dispatches, hits_delta,
+            failovers=failovers, external_detected=external_detected
+        )
         print(json.dumps(res, indent=2, ensure_ascii=False))
 
 

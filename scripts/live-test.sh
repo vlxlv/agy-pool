@@ -471,7 +471,9 @@ if per_acc:
     traffic_msg="$("$PYTHON" -c "import json; print(json.loads('''$conc_res''').get('message', ''))")"
 
     if [ "$traffic_status" = "CONCURRENT" ]; then
-        echo -e "  • ${CLR_RED}Traffic check: CONCURRENT (external pool traffic detected)${CLR_RESET}"
+        echo -e "  • ${CLR_RED}Traffic check: CONCURRENT (unrelated external pool traffic confirmed)${CLR_RESET}"
+    elif [ "$traffic_status" = "INTERNAL_MULTIDISPATCH" ]; then
+        echo -e "  • ${CLR_YELLOW}Traffic check: INTERNAL_MULTIDISPATCH (${traffic_msg})${CLR_RESET}"
     elif [ "$traffic_status" = "INCONCLUSIVE" ]; then
         echo -e "  • ${CLR_YELLOW}Traffic check: INCONCLUSIVE (${traffic_msg})${CLR_RESET}"
     else
@@ -483,6 +485,9 @@ if per_acc:
         verify_passed=false
     elif [ "$traffic_status" = "CONCURRENT" ]; then
         echo -e "\n${CLR_YELLOW}⚠ SCHEDULER TEST INCONCLUSIVE: Confirmed concurrent external pool traffic was detected.${CLR_RESET}" >&2
+        verify_passed=false
+    elif [ "$traffic_status" = "INTERNAL_MULTIDISPATCH" ]; then
+        echo -e "\n${CLR_YELLOW}⚠ SCHEDULER TEST INCONCLUSIVE: ${traffic_msg}${CLR_RESET}"
         verify_passed=false
     elif [ "$traffic_status" = "INCONCLUSIVE" ]; then
         echo -e "\n${CLR_YELLOW}⚠ SCHEDULER TEST INCONCLUSIVE: ${traffic_msg}${CLR_RESET}"
