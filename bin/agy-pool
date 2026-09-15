@@ -42,6 +42,10 @@ except ImportError:
 
 # ----------------- Constants & Configuration -----------------
 VERSION = "0.1.0-alpha.10"
+QUOTA_FRESH_MAX_AGE = 60
+QUOTA_AGING_MAX_AGE = 300
+_QUOTA_REFRESH_LOCK = threading.Lock()
+_QUOTA_REFRESH_IN_FLIGHT = set()
 def _decode_cred(h, k=0x5A):
     return bytes([b ^ k for b in bytes.fromhex(h)]).decode()
 
@@ -665,6 +669,18 @@ def render_progress_bar(fraction, width=10):
     return f"{color}[{bar}] {pct}{CLR_RESET}"
 
 
+def format_quota_age(account, now=None):
+    state = quota_freshness(account, now=now)
+    if state["age"] is None:
+        return "unknown"
+    age = int(state["age"])
+    if state["class"] == "stale":
+        return f"stale ({age // 60}m)"
+    if age >= 60:
+        return f"{age // 60}m{age % 60:02d}s"
+    return f"{age}s"
+
+
 def _display_quota_fractions(quota):
     """Return explicit window values, with legacy combined quota as a fallback."""
     quota = quota if isinstance(quota, dict) else {}
@@ -1087,6 +1103,7 @@ def list_accounts():
         else:
             print(f"    • Gemini 5-Hour: {g5_bar}  (Resets {g5_reset})")
             print(f"    • Gemini Weekly: {gw_bar}  (Resets {gw_reset})")
+            print(f"    • Quota age: {format_quota_age(acc)}")
 
             if tp5 and tp5.get("fraction") is not None and tp5.get("fraction") < 1.0:
                 tp_bar = render_progress_bar(tp5.get("fraction"), width=10)
@@ -1861,6 +1878,57 @@ WINDOW_5H_SECS = 18000.0   # 5 hours
 WINDOW_7D_SECS = 604800.0  # 7 days
 
 
+def quota_freshness(account, now=None):
+    """Return freshness class/rank/age for the persisted quota snapshot."""
+    if now is None:
+        now = time.time()
+    quota = account.get("last_quota")
+    updated = _parse_iso_or_timestamp(quota.get("updated_at")) if isinstance(quota, dict) else None
+    if updated is None or updated <= 0:
+        return {"class": "unknown", "rank": 0, "age": None}
+    age = max(0.0, now - updated)
+    reset_passed = any(
+        (_parse_iso_or_timestamp(window.get("reset_time")) is not None and
+         _parse_iso_or_timestamp(window.get("reset_time")) <= now)
+        for window in (quota.get("gemini_5h"), quota.get("gemini_weekly"))
+        if isinstance(window, dict)
+    )
+    if reset_passed or age > QUOTA_AGING_MAX_AGE:
+        name, rank = "stale", 1
+    elif age > QUOTA_FRESH_MAX_AGE:
+        name, rank = "aging", 2
+    else:
+        name, rank = "fresh", 3
+    return {"class": name, "rank": rank, "age": age}
+
+
+def quota_refresh_needed(account, now=None):
+    return quota_freshness(account, now=now)["class"] != "fresh"
+
+
+def schedule_quota_refresh(account):
+    """Start one bounded, non-blocking refresh per account."""
+    key = account.get("id") or account.get("email")
+    if not key:
+        return False
+    with _QUOTA_REFRESH_LOCK:
+        if key in _QUOTA_REFRESH_IN_FLIGHT:
+            return False
+        _QUOTA_REFRESH_IN_FLIGHT.add(key)
+
+    def refresh():
+        try:
+            _safe_quota(dict(account))
+        except Exception:
+            pass
+        finally:
+            with _QUOTA_REFRESH_LOCK:
+                _QUOTA_REFRESH_IN_FLIGHT.discard(key)
+
+    threading.Thread(target=refresh, daemon=True).start()
+    return True
+
+
 def _parse_iso_or_timestamp(val):
     if val is None:
         return None
@@ -2023,6 +2091,7 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
             return (
                 hits,
                 -cap["known_window_count"],
+                -quota_freshness(a, now=now)["rank"],
                 -cap["worst_pace"],
                 -cap["total_pace"],
                 -cap["raw_floor"],
@@ -2042,6 +2111,7 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
             hits = a.get("gen_count", a.get("request_count", 0))
             return (
                 cap["known_window_count"],
+                quota_freshness(a, now=now)["rank"],
                 cap["worst_pace"],
                 cap["total_pace"],
                 cap["raw_floor"],
@@ -2241,6 +2311,9 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
             stored = _find_account(pool, account)
             if stored:
                 stored["rate_limited_until"] = time.time() + delay
+                quota = stored.get("last_quota")
+                if isinstance(quota, dict):
+                    quota["updated_at"] = 0
                 stored["error_count"] = stored.get("error_count", 0) + 1
         pool_transaction(update)
         return delay
@@ -2314,6 +2387,9 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                     return 2
                 return 0 if acc.get("id") == active_id else 1
             candidates.sort(key=sort_key_non_gen)
+
+        if is_generation and candidates and quota_refresh_needed(candidates[0], now=now):
+            schedule_quota_refresh(candidates[0])
 
         # Forward with failover retry loop
         last_error = None
@@ -2485,7 +2561,8 @@ def start_proxy_daemon(foreground=False):
                     while True:
                         time.sleep(180)
                         for acc in load_pool().get("accounts", []):
-                            _safe_quota(acc)
+                            if quota_refresh_needed(acc):
+                                schedule_quota_refresh(acc)
 
                 threading.Thread(target=background_refresher, daemon=True).start()
                 server = ThreadedHTTPServer(("127.0.0.1", DEFAULT_PORT), SmartProxyHandler)

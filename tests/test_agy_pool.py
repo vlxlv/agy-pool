@@ -107,6 +107,9 @@ class AgyPoolTest(unittest.TestCase):
         agy_pool.AGY_CLI_DIR = os.path.join(gemini, "antigravity-cli")
         agy_pool.AGY_TOKEN_FILE = os.path.join(agy_pool.AGY_CLI_DIR, "antigravity-oauth-token")
         agy_pool.FILE_LOCKS.clear()
+        self.refresh_patch = mock.patch.object(agy_pool, "schedule_quota_refresh")
+        self.refresh_mock = self.refresh_patch.start()
+        self.addCleanup(self.refresh_patch.stop)
 
     def save_accounts(self, accounts, active="a"):
         agy_pool.save_pool({
@@ -141,6 +144,66 @@ class AgyPoolTest(unittest.TestCase):
         result = (response.status, data, dict(response.getheaders()))
         conn.close()
         return result
+
+    def test_fresh_snapshot_needs_no_refresh_and_aging_needs_one(self):
+        now = 1_000_000.0
+        fresh = {"last_quota": {"updated_at": now - 30}}
+        aging = {"last_quota": {"updated_at": now - 120}}
+        self.assertFalse(agy_pool.quota_refresh_needed(fresh, now))
+        self.assertTrue(agy_pool.quota_refresh_needed(aging, now))
+        agy_pool.schedule_quota_refresh(aging)
+        self.refresh_mock.assert_called_once_with(aging)
+
+    def test_quota_freshness_classes_and_reset_expiry(self):
+        now = 1_000_000.0
+        def snapshot(updated, reset=None):
+            return {"last_quota": {"updated_at": updated, "gemini_5h": {"fraction": 0.7, "reset_time": reset}}}
+        self.assertEqual(agy_pool.quota_freshness(snapshot(now - 30), now)["class"], "fresh")
+        self.assertEqual(agy_pool.quota_freshness(snapshot(now - 120), now)["class"], "aging")
+        self.assertEqual(agy_pool.quota_freshness(snapshot(now - 600), now)["class"], "stale")
+        self.assertEqual(agy_pool.quota_freshness({"last_quota": {}}, now)["class"], "unknown")
+        self.assertEqual(agy_pool.quota_freshness(snapshot(now - 1, now - 1), now)["class"], "stale")
+
+    def test_stale_refresh_is_single_flight(self):
+        self.refresh_patch.stop()
+        acc = account("single")
+        acc["last_quota"] = {"updated_at": 1, "gemini_5h": {"fraction": 0.7}}
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+        def refresh(_):
+            calls.append(1)
+            started.set()
+            release.wait(2)
+        with mock.patch.object(agy_pool, "_safe_quota", side_effect=refresh):
+            self.assertTrue(agy_pool.schedule_quota_refresh(acc))
+            self.assertFalse(agy_pool.schedule_quota_refresh(acc))
+            self.assertTrue(started.wait(1))
+            release.set()
+        for _ in range(20):
+            if not agy_pool._QUOTA_REFRESH_IN_FLIGHT:
+                break
+            time.sleep(0.01)
+        self.assertEqual(len(calls), 1)
+
+    def test_safe_quota_success_persists_fresh_timestamp(self):
+        acc = account("freshened")
+        old = {"updated_at": 1, "gemini_5h": {"fraction": 0.4}}
+        acc["last_quota"] = old
+        self.save_accounts([acc])
+        new = {"updated_at": int(time.time()), "gemini_5h": {"fraction": 0.8}}
+        with mock.patch.object(agy_pool, "query_quota", side_effect=lambda a: a.update(last_quota=new) or new):
+            self.assertTrue(agy_pool._safe_quota(dict(acc)))
+        self.assertEqual(agy_pool.load_pool()["accounts"][0]["last_quota"], new)
+
+    def test_safe_quota_failure_preserves_snapshot(self):
+        acc = account("not-freshened")
+        old = {"updated_at": 1, "gemini_5h": {"fraction": 0.4}}
+        acc["last_quota"] = old
+        self.save_accounts([acc])
+        with mock.patch.object(agy_pool, "query_quota", side_effect=OSError("offline")):
+            self.assertFalse(agy_pool._safe_quota(dict(acc)))
+        self.assertEqual(agy_pool.load_pool()["accounts"][0]["last_quota"], old)
 
     def test_unknown_quota_does_not_beat_known_capacity(self):
         now = time.time()
