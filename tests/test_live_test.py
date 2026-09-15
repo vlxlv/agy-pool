@@ -17,9 +17,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from scripts.live_test import (
+    GENERATION_ENDPOINTS,
     analyze_hits_delta,
     detect_concurrent_activity,
     get_log_offset,
+    is_generation_endpoint,
     parse_accounts,
     parse_log_delta,
     resolve_gateway_port,
@@ -324,14 +326,14 @@ Refreshing quota for 1 account(s)...
         with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as f:
             log_path = f.name
             # Write large initial log
-            f.write("[2026-09-15 09:00:00] [PROXY] POST req1 -> old@test.com (Status: 200)\n" * 10)
+            f.write("[2026-09-15 09:00:00] [PROXY] POST streamGenerateContent -> old@test.com (Status: 200)\n" * 10)
             f.flush()
             old_offset = f.tell()
 
         try:
             # Simulate log rotation / truncation: write a much smaller fresh log
             with open(log_path, "w", encoding="utf-8") as f:
-                f.write("[2026-09-15 10:00:00] [PROXY] POST req2 -> fresh@test.com (Status: 200)\n")
+                f.write("[2026-09-15 10:00:00] [PROXY] POST streamGenerateContent -> fresh@test.com (Status: 200)\n")
 
             # Offset from previous large file exceeds new file size
             delta = parse_log_delta(log_path, start_offset=old_offset)
@@ -450,6 +452,263 @@ Refreshing quota for 1 account(s)...
             resolve_gateway_port("70000")
         with self.assertRaises(ValueError):
             resolve_gateway_port("invalid")
+
+
+    def test_authoritative_generation_endpoints(self):
+        # Exact authoritative endpoints defined from production handle_proxy()
+        self.assertIn("streamGenerateContent", GENERATION_ENDPOINTS)
+        self.assertIn("generateContent", GENERATION_ENDPOINTS)
+        self.assertIn("v1internal:streamGenerateContent", GENERATION_ENDPOINTS)
+        self.assertIn("v1internal:generateContent", GENERATION_ENDPOINTS)
+
+        # True for generation endpoints in various real-world logging forms
+        self.assertTrue(is_generation_endpoint("streamGenerateContent"))
+        self.assertTrue(is_generation_endpoint("generateContent"))
+        self.assertTrue(is_generation_endpoint("v1internal:streamGenerateContent"))
+        self.assertTrue(is_generation_endpoint("v1internal:streamGenerateContent?alt=sse"))
+        self.assertTrue(is_generation_endpoint("v1internal:generateContent"))
+        self.assertTrue(is_generation_endpoint("v1internal:generateContent?alt=sse"))
+        self.assertTrue(is_generation_endpoint("models/gemini-1.5-pro:streamGenerateContent"))
+        self.assertTrue(is_generation_endpoint("models/gemini-1.5-pro:generateContent"))
+
+        # False for auxiliary gateway traffic
+        self.assertFalse(is_generation_endpoint("v1internal:loadCodeAssist"))
+        self.assertFalse(is_generation_endpoint("v1internal:fetchUserInfo"))
+        self.assertFalse(is_generation_endpoint("v1internal:listExperiments"))
+        self.assertFalse(is_generation_endpoint("v1internal:writeTrajectoryAcls"))
+        self.assertFalse(is_generation_endpoint("v1internal:retrieveUserQuotaSummary"))
+        self.assertFalse(is_generation_endpoint("v1internal:fetchAdminControls"))
+        self.assertFalse(is_generation_endpoint("v1internal:fetchAvailableModels"))
+        self.assertFalse(is_generation_endpoint("v1internal:recordTrajectoryAnalytics"))
+        self.assertFalse(is_generation_endpoint(""))
+        self.assertFalse(is_generation_endpoint(None))
+
+    def test_case_a_single_generation_with_auxiliary_traffic(self):
+        """
+        Regression Case A:
+        1 outer live generation
+        15 auxiliary gateway requests
+        1 successful streamGenerateContent
+        Expected:
+        generation dispatch count = 1
+        not concurrent
+        """
+        aux_endpoints = [
+            "v1internal:loadCodeAssist",
+            "v1internal:loadCodeAssist",
+            "v1internal:fetchUserInfo",
+            "v1internal:listExperiments",
+            "v1internal:listExperiments",
+            "v1internal:writeTrajectoryAcls",
+            "v1internal:retrieveUserQuotaSummary",
+            "v1internal:loadCodeAssist",
+            "v1internal:recordTrajectoryAnalytics",
+            "v1internal:fetchAdminControls",
+            "v1internal:fetchAvailableModels",
+            "v1internal:loadCodeAssist",
+            "v1internal:retrieveUserQuotaSummary",
+            "v1internal:fetchUserInfo",
+            "v1internal:writeTrajectoryAcls",
+        ]
+        self.assertEqual(len(aux_endpoints), 15)
+
+        with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as f:
+            log_path = f.name
+            for ep in aux_endpoints:
+                f.write(f"[2026-09-15 13:44:34] [PROXY] POST {ep} -> zhangy0623@gmail.com (Status: 200)\n")
+            f.write("[2026-09-15 13:44:35] [PROXY] POST v1internal:streamGenerateContent?alt=sse -> solaris18990@gmail.com (Status: 200)\n")
+            f.flush()
+
+        try:
+            delta = parse_log_delta(log_path, 0)
+            self.assertEqual(delta["total_proxy_events"], 16)
+            self.assertEqual(delta["auxiliary_events_count"], 15)
+            self.assertEqual(delta["generation_attempts_count"], 1)
+            self.assertEqual(delta["successful_dispatches_count"], 1)
+            self.assertEqual(delta["generation_dispatches"], ["solaris18990@gmail.com"])
+            self.assertEqual(delta["dispatches"], ["solaris18990@gmail.com"])
+            self.assertEqual(len(delta["failovers"]), 0)
+
+            # Concurrency check must ignore auxiliary traffic and evaluate to CLEAN
+            hits_delta = {"total_delta": 1, "gcd": 1}
+            conc = detect_concurrent_activity(1, delta["generation_dispatches"], hits_delta)
+            self.assertEqual(conc["status"], "CLEAN")
+            self.assertFalse(conc["concurrent_detected"])
+            self.assertFalse(conc["is_inconclusive"])
+
+            # Verify scheduler uses the single generation dispatch
+            accounts = [{"email": "solaris18990@gmail.com", "quota": 1.0, "is_eligible": True}]
+            res = verify_max_quota(delta["generation_dispatches"], accounts)
+            self.assertTrue(res["passed"])
+        finally:
+            os.unlink(log_path)
+
+    def test_case_b_nine_generations_with_large_auxiliary_volume(self):
+        """
+        Regression Case B:
+        9 live generations
+        large volume of auxiliary gateway requests (146 auxiliary)
+        9 successful generation dispatches
+        Expected:
+        generation dispatch count = 9
+        auxiliary volume ignored for scheduler validation
+        """
+        accounts = [
+            {"email": "a@test.com", "is_eligible": True},
+            {"email": "b@test.com", "is_eligible": True},
+            {"email": "c@test.com", "is_eligible": True},
+        ]
+        # 9 cyclic round robin dispatches
+        gen_sequence = ["a@test.com", "b@test.com", "c@test.com"] * 3
+
+        with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as f:
+            log_path = f.name
+            # Interleave 146 auxiliary requests and 9 generation dispatches
+            # Total events = 155 (exact numbers observed in real SJC run)
+            gen_idx = 0
+            for i in range(146):
+                f.write(f"[2026-09-15 13:46:12] [PROXY] POST v1internal:loadCodeAssist -> active@test.com (Status: 200)\n")
+                if i % 16 == 0 and gen_idx < 9:
+                    f.write(f"[2026-09-15 13:46:17] [PROXY] POST v1internal:streamGenerateContent?alt=sse -> {gen_sequence[gen_idx]} (Status: 200)\n")
+                    gen_idx += 1
+            while gen_idx < 9:
+                f.write(f"[2026-09-15 13:47:00] [PROXY] POST v1internal:streamGenerateContent?alt=sse -> {gen_sequence[gen_idx]} (Status: 200)\n")
+                gen_idx += 1
+            f.flush()
+
+        try:
+            delta = parse_log_delta(log_path, 0)
+            self.assertEqual(delta["total_proxy_events"], 155)
+            self.assertEqual(delta["auxiliary_events_count"], 146)
+            self.assertEqual(delta["generation_attempts_count"], 9)
+            self.assertEqual(delta["successful_dispatches_count"], 9)
+            self.assertEqual(delta["generation_dispatches"], gen_sequence)
+            self.assertEqual(len(delta["failovers"]), 0)
+
+            # Round robin validation must pass on generation sequence, ignoring all 146 auxiliary requests
+            rr_res = verify_round_robin(delta["generation_dispatches"], accounts)
+            self.assertTrue(rr_res["passed"])
+
+            # Concurrency check must not be confused by the 146 auxiliary calls
+            hits_delta = {"total_delta": 9, "gcd": 1}
+            conc = detect_concurrent_activity(9, delta["generation_dispatches"], hits_delta)
+            self.assertEqual(conc["status"], "CLEAN")
+            self.assertFalse(conc["concurrent_detected"])
+            self.assertFalse(conc["is_inconclusive"])
+        finally:
+            os.unlink(log_path)
+
+    def test_case_c_generation_request_fails_over_account_a_to_b(self):
+        """
+        Regression Case C:
+        Generation request fails on account A and fails over successfully to B.
+        Expected:
+        - generation attempt/failover is represented correctly;
+        - successful scheduler selection sequence reflects the effective dispatch semantics used by the verifier;
+        - not automatically treated as unrelated external concurrency.
+        """
+        with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as f:
+            log_path = f.name
+            f.write("[2026-09-15 10:00:00] [PROXY ERROR] POST streamGenerateContent -> a@test.com HTTP 429\n")
+            f.write("[2026-09-15 10:00:00] [FAILOVER] Account a@test.com hit rate limit/quota error! Cooldown 300s. Auto-switching to next account...\n")
+            f.write("[2026-09-15 10:00:01] [PROXY] POST streamGenerateContent -> b@test.com (Status: 200)\n")
+            f.flush()
+
+        try:
+            delta = parse_log_delta(log_path, 0)
+            # Generation attempts: 2 (attempt on A failed 429, attempt on B succeeded 200)
+            self.assertEqual(delta["generation_attempts_count"], 2)
+            self.assertEqual(delta["generation_attempts"][0]["account"], "a@test.com")
+            self.assertEqual(delta["generation_attempts"][0]["status"], 429)
+            self.assertEqual(delta["generation_attempts"][1]["account"], "b@test.com")
+            self.assertEqual(delta["generation_attempts"][1]["status"], 200)
+
+            # Failovers and quota events
+            self.assertEqual(delta["failovers_count"], 1)
+            self.assertEqual(delta["failovers"][0]["account"], "a@test.com")
+            self.assertGreaterEqual(delta["quota_events_count"], 1)
+
+            # Effective successful generation dispatch sequence contains only b@test.com
+            self.assertEqual(delta["successful_dispatches_count"], 1)
+            self.assertEqual(delta["generation_dispatches"], ["b@test.com"])
+
+            # Verifier semantics: account B is verified as the effective recipient
+            accounts_after_failover = [
+                {"email": "a@test.com", "quota": 0.90, "is_cooling": True, "is_eligible": False},
+                {"email": "b@test.com", "quota": 0.80, "is_eligible": True},
+            ]
+            v_res = verify_max_quota(delta["generation_dispatches"], accounts_after_failover)
+            self.assertTrue(v_res["passed"])
+
+            # Concurrency detection accounts for failover and does not flag external concurrency
+            hits_delta = {"total_delta": 1, "gcd": 1}
+            conc = detect_concurrent_activity(1, delta["generation_dispatches"], hits_delta, failovers=delta["failovers"])
+            self.assertEqual(conc["status"], "CLEAN")
+            self.assertFalse(conc["concurrent_detected"])
+            self.assertFalse(conc["is_inconclusive"])
+        finally:
+            os.unlink(log_path)
+
+    def test_case_d_unrelated_generation_request_inconclusive(self):
+        """
+        Regression Case D:
+        An actual unrelated generation request appears during the test window and cannot be correlated safely.
+        Expected:
+        INCONCLUSIVE / possible concurrent generation traffic
+        not false PASS.
+        """
+        with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as f:
+            log_path = f.name
+            # Test expected 1 run, but 2 generation requests executed (without failover)
+            f.write("[2026-09-15 10:00:00] [PROXY] POST streamGenerateContent -> a@test.com (Status: 200)\n")
+            f.write("[2026-09-15 10:00:05] [PROXY] POST streamGenerateContent -> unrelated@test.com (Status: 200)\n")
+            f.flush()
+
+        try:
+            delta = parse_log_delta(log_path, 0)
+            self.assertEqual(delta["generation_dispatches"], ["a@test.com", "unrelated@test.com"])
+            self.assertEqual(len(delta["failovers"]), 0)
+
+            # Uncorrelated extra generation traffic must evaluate to INCONCLUSIVE (not CLEAN / false PASS)
+            hits_delta = {"total_delta": 2, "gcd": 1}
+            conc = detect_concurrent_activity(1, delta["generation_dispatches"], hits_delta, failovers=delta["failovers"])
+            self.assertEqual(conc["status"], "INCONCLUSIVE")
+            self.assertTrue(conc["is_inconclusive"])
+            self.assertFalse(conc["concurrent_detected"])
+            self.assertIn("concurrent generation traffic", conc["message"].lower())
+        finally:
+            os.unlink(log_path)
+
+    def test_analyze_hits_delta_per_account_details(self):
+        before = [
+            {"email": "a@test.com", "hits": 10},
+            {"email": "b@test.com", "hits": 5},
+        ]
+        after = [
+            {"email": "a@test.com", "hits": 12},
+            {"email": "b@test.com", "hits": 5},
+        ]
+        res = analyze_hits_delta(before, after)
+        self.assertIn("per_account", res)
+        self.assertEqual(len(res["per_account"]), 2)
+        self.assertEqual(res["per_account"][0], {"account": "a@test.com", "before": 10, "after": 12, "delta": 2})
+        self.assertEqual(res["per_account"][1], {"account": "b@test.com", "before": 5, "after": 5, "delta": 0})
+
+    def test_auxiliary_error_does_not_count_as_generation_attempt(self):
+        with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as f:
+            log_path = f.name
+            f.write("[2026-09-15 10:00:00] [PROXY ERROR] POST v1internal:loadCodeAssist -> a@test.com HTTP 500\n")
+            f.write("[2026-09-15 10:00:01] [PROXY EXCEPTION] POST v1internal:fetchUserInfo -> a@test.com: timeout\n")
+            f.flush()
+
+        try:
+            delta = parse_log_delta(log_path, 0)
+            self.assertEqual(delta["total_proxy_events"], 2)
+            self.assertEqual(delta["auxiliary_events_count"], 2)
+            self.assertEqual(delta["generation_attempts_count"], 0)
+            self.assertEqual(delta["successful_dispatches_count"], 0)
+        finally:
+            os.unlink(log_path)
 
 
 if __name__ == "__main__":

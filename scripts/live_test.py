@@ -50,6 +50,37 @@ LOG_PROXY_EXC_RE = re.compile(
     r'^\[(?P<ts>[^\]]+)\]\s+\[PROXY EXCEPTION\]\s+(?P<method>\S+)\s+(?P<endpoint>\S+)\s+->\s+(?P<account>\S+):\s+(?P<error>.*)'
 )
 
+# Authoritative generation endpoint identifiers based on production SmartProxyHandler.handle_proxy()
+# In production bin/agy-pool, candidate load-balancing is performed if and only if:
+#     is_generation = ("generatecontent" in path.lower())
+# In gateway proxy log lines, endpoints appear as path.split('/')[-1] (e.g.
+# streamGenerateContent, generateContent, v1internal:streamGenerateContent, etc.,
+# potentially followed by query parameters such as ?alt=sse).
+GENERATION_ENDPOINTS = frozenset({
+    "streamGenerateContent",
+    "generateContent",
+    "v1internal:streamGenerateContent",
+    "v1internal:generateContent",
+})
+
+
+def is_generation_endpoint(endpoint: str) -> bool:
+    """
+    Check if an endpoint string from gateway logs corresponds to an authoritative generation request.
+    Matches production SmartProxyHandler.handle_proxy() candidate selection logic:
+    load balancing is performed when 'generatecontent' in path.lower().
+    Strips query parameters (e.g. ?alt=sse) and handles colon/model prefixes.
+    """
+    if not endpoint:
+        return False
+    base = endpoint.split("?")[0]
+    if base in GENERATION_ENDPOINTS:
+        return True
+    method = base.split(":")[-1]
+    if method in GENERATION_ENDPOINTS:
+        return True
+    return "generatecontent" in base.lower()
+
 
 def strip_ansi(text: str) -> str:
     """Remove all ANSI escape codes from string."""
@@ -202,20 +233,43 @@ def get_log_offset(log_path: str) -> int:
 def parse_log_delta(log_path: str, start_offset: int = 0) -> Dict[str, Any]:
     """
     Read newly appended lines from log_path starting at start_offset.
-    Parses PROXY, FAILOVER, and ERROR lines.
+    Parses PROXY, FAILOVER, and ERROR lines, distinguishing:
+      - all gateway proxy events
+      - generation attempts (all requests targeting generation endpoints)
+      - successful generation dispatches (successful 200 responses for generation endpoints)
+      - failovers (gateway account switch events)
+      - quota/rate-limit events (HTTP 429/403 or quota exhaustion failovers)
+      - auxiliary gateway events (metadata, auth, config, session traffic)
     """
     if not os.path.exists(log_path):
         return {
             "new_offset": 0,
             "events": [],
+            "gateway_proxy_events": [],
+            "generation_attempts": [],
+            "generation_dispatches": [],
+            "successful_generation_dispatches": [],
             "dispatches": [],
             "failovers": [],
+            "quota_events": [],
+            "auxiliary_events": [],
             "total_events": 0,
+            "total_proxy_events": 0,
+            "generation_attempts_count": 0,
+            "successful_dispatches_count": 0,
+            "auxiliary_events_count": 0,
+            "failovers_count": 0,
+            "quota_events_count": 0,
+            "truncated": False,
         }
 
     events = []
-    dispatches = []
+    gateway_proxy_events = []
+    generation_attempts = []
+    generation_dispatches = []
     failovers = []
+    quota_events = []
+    auxiliary_events = []
     new_offset = start_offset
     truncated = False
 
@@ -236,6 +290,7 @@ def parse_log_delta(log_path: str, start_offset: int = 0) -> Dict[str, Any]:
                 if m_proxy:
                     d = m_proxy.groupdict()
                     status_code = int(d["status"])
+                    is_gen = is_generation_endpoint(d["endpoint"])
                     ev = {
                         "type": "proxy",
                         "timestamp": d["ts"],
@@ -243,42 +298,65 @@ def parse_log_delta(log_path: str, start_offset: int = 0) -> Dict[str, Any]:
                         "endpoint": d["endpoint"],
                         "account": d["account"],
                         "status": status_code,
+                        "is_generation": is_gen,
                     }
                     events.append(ev)
-                    if status_code == 200:
-                        dispatches.append(d["account"])
+                    gateway_proxy_events.append(ev)
+                    if is_gen:
+                        generation_attempts.append(ev)
+                        if status_code == 200:
+                            generation_dispatches.append(d["account"])
+                        elif status_code in (429, 403):
+                            quota_events.append(ev)
+                    else:
+                        auxiliary_events.append(ev)
                     continue
 
                 m_fail = LOG_FAILOVER_RE.match(line_str)
                 if m_fail:
                     d = m_fail.groupdict()
+                    reason = d["reason"].strip()
                     ev = {
                         "type": "failover",
                         "timestamp": d["ts"],
                         "account": d["account"],
-                        "reason": d["reason"].strip(),
+                        "reason": reason,
                     }
                     events.append(ev)
                     failovers.append(ev)
+                    reason_lower = reason.lower()
+                    if "rate limit" in reason_lower or "quota" in reason_lower or "429" in reason_lower:
+                        quota_events.append(ev)
                     continue
 
                 m_err = LOG_PROXY_ERROR_RE.match(line_str)
                 if m_err:
                     d = m_err.groupdict()
+                    status_code = int(d["status"])
+                    is_gen = is_generation_endpoint(d["endpoint"])
                     ev = {
                         "type": "proxy_error",
                         "timestamp": d["ts"],
                         "method": d["method"],
                         "endpoint": d["endpoint"],
                         "account": d["account"],
-                        "status": int(d["status"]),
+                        "status": status_code,
+                        "is_generation": is_gen,
                     }
                     events.append(ev)
+                    gateway_proxy_events.append(ev)
+                    if is_gen:
+                        generation_attempts.append(ev)
+                        if status_code in (429, 403):
+                            quota_events.append(ev)
+                    else:
+                        auxiliary_events.append(ev)
                     continue
 
                 m_exc = LOG_PROXY_EXC_RE.match(line_str)
                 if m_exc:
                     d = m_exc.groupdict()
+                    is_gen = is_generation_endpoint(d["endpoint"])
                     ev = {
                         "type": "proxy_exception",
                         "timestamp": d["ts"],
@@ -286,8 +364,14 @@ def parse_log_delta(log_path: str, start_offset: int = 0) -> Dict[str, Any]:
                         "endpoint": d["endpoint"],
                         "account": d["account"],
                         "error": d["error"].strip(),
+                        "is_generation": is_gen,
                     }
                     events.append(ev)
+                    gateway_proxy_events.append(ev)
+                    if is_gen:
+                        generation_attempts.append(ev)
+                    else:
+                        auxiliary_events.append(ev)
                     continue
 
             new_offset = f.tell()
@@ -297,9 +381,21 @@ def parse_log_delta(log_path: str, start_offset: int = 0) -> Dict[str, Any]:
     return {
         "new_offset": new_offset,
         "events": events,
-        "dispatches": dispatches,
+        "gateway_proxy_events": gateway_proxy_events,
+        "generation_attempts": generation_attempts,
+        "generation_dispatches": generation_dispatches,
+        "successful_generation_dispatches": generation_dispatches,
+        "dispatches": generation_dispatches,
         "failovers": failovers,
+        "quota_events": quota_events,
+        "auxiliary_events": auxiliary_events,
         "total_events": len(events),
+        "total_proxy_events": len(gateway_proxy_events),
+        "generation_attempts_count": len(generation_attempts),
+        "successful_dispatches_count": len(generation_dispatches),
+        "auxiliary_events_count": len(auxiliary_events),
+        "failovers_count": len(failovers),
+        "quota_events_count": len(quota_events),
         "truncated": truncated,
     }
 
@@ -317,9 +413,28 @@ def analyze_hits_delta(
     after_map = {a.get("email") or a.get("id"): a.get("hits", 0) for a in after_accounts}
 
     deltas = {}
-    for key, after_hits in after_map.items():
-        before_hits = before_map.get(key, 0)
-        deltas[key] = max(0, after_hits - before_hits)
+    details = []
+    all_keys = []
+    for a in before_accounts:
+        k = a.get("email") or a.get("id")
+        if k and k not in all_keys:
+            all_keys.append(k)
+    for a in after_accounts:
+        k = a.get("email") or a.get("id")
+        if k and k not in all_keys:
+            all_keys.append(k)
+
+    for key in all_keys:
+        b_hits = before_map.get(key, 0)
+        a_hits = after_map.get(key, 0)
+        d = max(0, a_hits - b_hits)
+        deltas[key] = d
+        details.append({
+            "account": key,
+            "before": b_hits,
+            "after": a_hits,
+            "delta": d,
+        })
 
     total_delta = sum(deltas.values())
     positive_deltas = [d for d in deltas.values() if d > 0]
@@ -340,6 +455,7 @@ def analyze_hits_delta(
         "gcd": gcd_val,
         "normalized": normalized,
         "zero_delta": (total_delta == 0),
+        "per_account": details,
     }
 
 
@@ -574,35 +690,40 @@ def detect_concurrent_activity(
     expected_runs: int,
     dispatches: List[str],
     hits_delta: Dict[str, Any],
-    tolerance_ratio: float = 2.0
+    tolerance_ratio: float = 2.0,
+    failovers: Optional[List[Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Detect whether external concurrent requests were processed by the pool during the test.
-    The tolerance_ratio (default 2.0) acts as an ambiguity heuristic, not proof of clean traffic:
-    - 9 -> 10 dispatches: Minor internal sub-dispatch within nominal slack (<= expected_runs + 1).
-      Evaluates to CLEAN (not a false positive).
-    - Intermediate excess traffic (e.g. 9 -> 14 dispatches): Exceeds nominal slack but within
-      tolerance_ratio. Evaluates to INCONCLUSIVE (warns rather than silently passing).
-    - 9 -> 25 dispatches: Exceeds tolerance_ratio. Evaluates to CONCURRENT.
+    Detect whether external concurrent generation requests were processed by the pool during the test.
+    Auxiliary requests (metadata, config, session, auth, quota) are excluded from this check.
+
+    - For expected_runs == 1: Exactly 1 generation dispatch is expected (unless accounted failovers occur).
+      Any extra unexplained generation dispatch evaluates to INCONCLUSIVE.
+    - For expected_runs > 1: Nominal slack of +1 dispatch accounts for internal sub-dispatch / continuation.
+    - Intermediate excess traffic (exceeding nominal slack but <= tolerance_ratio) evaluates to INCONCLUSIVE.
+    - Severe excess traffic exceeding tolerance_ratio evaluates to CONCURRENT.
     """
     observed_dispatches = len(dispatches)
     total_delta = hits_delta.get("total_delta", 0)
     gcd_val = hits_delta.get("gcd", 1) or 1
+    failover_count = len(failovers) if isinstance(failovers, list) else int(failovers or 0)
 
-    # Nominal slack: single outer CLI call may issue 1 extra sub-request (e.g. metadata/continuation)
-    minor_slack_dispatches = expected_runs + 1
-    minor_slack_hits = (expected_runs + 1) * gcd_val
+    # For expected_runs == 1, exactly 1 generation dispatch is expected.
+    # For expected_runs > 1, allow nominal slack of +1 for potential sub-dispatch.
+    minor_slack_dispatches = expected_runs if expected_runs <= 1 else (expected_runs + 1)
+    minor_slack_hits = (minor_slack_dispatches + failover_count) * gcd_val
 
     # Hard threshold beyond which external traffic is confirmed
     hard_max_dispatches = max(expected_runs + 2, int(math.ceil(expected_runs * tolerance_ratio)))
-    hard_max_hits = max((expected_runs + 2) * gcd_val, int(math.ceil(expected_runs * tolerance_ratio * gcd_val)))
+    hard_max_hits = max((expected_runs + 2 + failover_count) * gcd_val,
+                         int(math.ceil((expected_runs * tolerance_ratio + failover_count) * gcd_val)))
 
     if observed_dispatches > hard_max_dispatches or total_delta > hard_max_hits:
         status = "CONCURRENT"
         concurrent_detected = True
         is_inconclusive = False
         message = (
-            f"Confirmed concurrent external traffic: observed {observed_dispatches} dispatches "
+            f"Confirmed concurrent external traffic: observed {observed_dispatches} generation dispatches "
             f"(expected <= {hard_max_dispatches}) or +{total_delta} Hits (expected <= {hard_max_hits})"
         )
     elif observed_dispatches > minor_slack_dispatches or total_delta > minor_slack_hits:
@@ -610,8 +731,8 @@ def detect_concurrent_activity(
         concurrent_detected = False
         is_inconclusive = True
         message = (
-            f"Intermediate excess traffic detected: observed {observed_dispatches} dispatches "
-            f"for {expected_runs} expected runs. Ambiguous between internal multi-dispatch and background pool activity"
+            f"Possible concurrent generation traffic / ambiguous excess requests: observed {observed_dispatches} "
+            f"generation dispatches for {expected_runs} expected run(s)"
         )
     else:
         status = "CLEAN"
@@ -626,6 +747,7 @@ def detect_concurrent_activity(
         "expected_runs": expected_runs,
         "observed_dispatches": observed_dispatches,
         "total_hits_delta": total_delta,
+        "failover_count": failover_count,
         "message": message,
     }
 
@@ -698,6 +820,7 @@ def main():
     dc_p.add_argument("--expected", type=int, required=True, help="Expected number of runs")
     dc_p.add_argument("--dispatches", required=True, help="JSON list of dispatched accounts or file")
     dc_p.add_argument("--hits-delta", required=True, help="Hits delta JSON or file")
+    dc_p.add_argument("--failovers", default=None, help="Failovers JSON list or file (optional)")
 
     args = parser.parse_args()
 
@@ -756,8 +879,15 @@ def main():
         h_content = _read_input(args.hits_delta)
         dispatches = json.loads(d_content) if isinstance(d_content, str) else d_content
         hits_delta = json.loads(h_content) if isinstance(h_content, str) else h_content
+        failovers = None
+        if getattr(args, "failovers", None):
+            f_content = _read_input(args.failovers)
+            try:
+                failovers = json.loads(f_content) if isinstance(f_content, str) else f_content
+            except Exception:
+                failovers = None
 
-        res = detect_concurrent_activity(args.expected, dispatches, hits_delta)
+        res = detect_concurrent_activity(args.expected, dispatches, hits_delta, failovers=failovers)
         print(json.dumps(res, indent=2, ensure_ascii=False))
 
 

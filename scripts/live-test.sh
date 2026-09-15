@@ -359,24 +359,68 @@ run_strategy_test() {
         --before "${TMP_DIR}/accounts_before.json" \
         --after "${TMP_DIR}/accounts_after.json" > "${TMP_DIR}/hits_delta.json"
 
-    # Extract dispatches
+    # Extract counts and metrics from log delta
+    local proxy_events_count
+    proxy_events_count="$("$PYTHON" -c "import json; d=json.load(open('${TMP_DIR}/log_delta.json')); print(d.get('total_proxy_events', len(d.get('gateway_proxy_events', []))))")"
+    local gen_attempts_count
+    gen_attempts_count="$("$PYTHON" -c "import json; d=json.load(open('${TMP_DIR}/log_delta.json')); print(d.get('generation_attempts_count', len(d.get('generation_attempts', []))))")"
+    local gen_dispatches_count
+    gen_dispatches_count="$("$PYTHON" -c "import json; d=json.load(open('${TMP_DIR}/log_delta.json')); print(d.get('successful_dispatches_count', len(d.get('generation_dispatches', d.get('dispatches', []))))))")"
+    local aux_events_count
+    aux_events_count="$("$PYTHON" -c "import json; d=json.load(open('${TMP_DIR}/log_delta.json')); print(d.get('auxiliary_events_count', len(d.get('auxiliary_events', []))))")"
+    local failovers_count
+    failovers_count="$("$PYTHON" -c "import json; d=json.load(open('${TMP_DIR}/log_delta.json')); print(d.get('failovers_count', len(d.get('failovers', []))))")"
+
+    # Extract genuine generation dispatches and failovers
     "$PYTHON" -c "
 import json
 delta = json.load(open('${TMP_DIR}/log_delta.json'))
-print(json.dumps(delta.get('dispatches', [])))
+print(json.dumps(delta.get('generation_dispatches', delta.get('dispatches', []))))
 " > "${TMP_DIR}/dispatches.json"
 
-    local dispatch_count
-    dispatch_count="$("$PYTHON" -c "import json; print(len(json.load(open('${TMP_DIR}/dispatches.json'))))")"
+    "$PYTHON" -c "
+import json
+delta = json.load(open('${TMP_DIR}/log_delta.json'))
+print(json.dumps(delta.get('failovers', [])))
+" > "${TMP_DIR}/failovers.json"
 
     echo -e "\n${CLR_BOLD}Results Summary:${CLR_RESET}"
     echo "  • Successful requests: ${successful_runs}/${test_runs}"
-    echo "  • Gateway log dispatches recorded: ${dispatch_count}"
+    echo "  • Gateway proxy events: ${proxy_events_count}"
+    echo "  • Generation attempts: ${gen_attempts_count}"
+    echo "  • Successful generation dispatches: ${gen_dispatches_count}"
+    echo "  • Auxiliary gateway events: ${aux_events_count}"
+
+    if [ "$failovers_count" -gt 0 ]; then
+        local failover_summary
+        failover_summary="$("$PYTHON" -c "
+import json
+delta = json.load(open('${TMP_DIR}/log_delta.json'))
+fails = delta.get('failovers', [])
+summary = '; '.join(f\"{f.get('account')}: {f.get('reason', '')}\" for f in fails)
+print(summary)
+")"
+        echo -e "  • ${CLR_YELLOW}Failovers recorded: ${failovers_count} (${failover_summary})${CLR_RESET}"
+    fi
+
+    # For scheduler tests print the account generation sequence when available
+    local gen_seq_display
+    gen_seq_display="$("$PYTHON" -c "
+import json
+dispatches = json.load(open('${TMP_DIR}/dispatches.json'))
+if dispatches:
+    print(' -> '.join(dispatches))
+else:
+    print('')
+")"
+    if [ -n "$gen_seq_display" ]; then
+        echo "  • Account generation sequence: ${gen_seq_display}"
+    fi
 
     # Verify scheduler
     local verify_res=""
     local verify_passed=false
-    if [ "$dispatch_count" -gt 0 ]; then
+    if [ "$gen_dispatches_count" -gt 0 ]; then
         set +e
         verify_res="$("$PYTHON" "$LIVE_TEST_PY" verify-scheduler \
             --strategy "$target_strategy" \
@@ -387,7 +431,7 @@ print(json.dumps(delta.get('dispatches', [])))
         fi
         set -e
     else
-        verify_res='{"passed": false, "reason": "No dispatches recorded in gateway proxy log"}'
+        verify_res='{"passed": false, "reason": "No successful generation dispatches recorded in gateway proxy log"}'
     fi
 
     # Check Hits delta
@@ -398,18 +442,33 @@ print(json.dumps(delta.get('dispatches', [])))
     local gcd_val
     gcd_val="$("$PYTHON" -c "import json; print(json.load(open('${TMP_DIR}/hits_delta.json')).get('gcd', 1))")"
 
-    # Detect concurrent activity
+    echo "  • Hits delta: total +${total_hits_delta} (GCD unit: ${gcd_val})"
+    echo "  • Per-account Hits:"
+    "$PYTHON" -c "
+import json
+h = json.load(open('${TMP_DIR}/hits_delta.json'))
+per_acc = h.get('per_account', [])
+if per_acc:
+    print(f'    {\"ACCOUNT\":<35} {\"BEFORE\":>7} {\"AFTER\":>7} {\"DELTA\":>7}')
+    for item in per_acc:
+        acc = item['account']
+        b = str(item['before'])
+        a = str(item['after'])
+        d = f\"+{item['delta']}\" if item['delta'] >= 0 else str(item['delta'])
+        print(f'    {acc:<35} {b:>7} {a:>7} {d:>7}')
+"
+
+    # Detect concurrent activity (scoped to generation traffic)
     local conc_res
     conc_res="$("$PYTHON" "$LIVE_TEST_PY" detect-concurrent \
         --expected "$test_runs" \
         --dispatches "${TMP_DIR}/dispatches.json" \
-        --hits-delta "${TMP_DIR}/hits_delta.json")"
+        --hits-delta "${TMP_DIR}/hits_delta.json" \
+        --failovers "${TMP_DIR}/failovers.json")"
     local traffic_status
     traffic_status="$("$PYTHON" -c "import json; print(json.loads('''$conc_res''').get('status', 'CLEAN'))")"
     local traffic_msg
     traffic_msg="$("$PYTHON" -c "import json; print(json.loads('''$conc_res''').get('message', ''))")"
-
-    echo "  • Hits delta: total +${total_hits_delta} (GCD unit: ${gcd_val})"
 
     if [ "$traffic_status" = "CONCURRENT" ]; then
         echo -e "  • ${CLR_RED}Traffic check: CONCURRENT (external pool traffic detected)${CLR_RESET}"
@@ -426,12 +485,8 @@ print(json.dumps(delta.get('dispatches', [])))
         echo -e "\n${CLR_YELLOW}⚠ SCHEDULER TEST INCONCLUSIVE: Confirmed concurrent external pool traffic was detected.${CLR_RESET}" >&2
         verify_passed=false
     elif [ "$traffic_status" = "INCONCLUSIVE" ]; then
-        echo -e "\n${CLR_YELLOW}⚠ SCHEDULER TEST WARNING (INCONCLUSIVE): Intermediate excess traffic observed; verification result may be ambiguous.${CLR_RESET}"
-        if [ "$verify_passed" = "true" ]; then
-            local detail
-            detail="$("$PYTHON" -c "import json; print(json.loads('''$verify_res''').get('details', 'OK'))")"
-            echo -e "${CLR_GREEN}  ↳ Dispatched sequence matched: ${detail}${CLR_RESET}"
-        fi
+        echo -e "\n${CLR_YELLOW}⚠ SCHEDULER TEST INCONCLUSIVE: ${traffic_msg}${CLR_RESET}"
+        verify_passed=false
     elif [ "$verify_passed" = "true" ]; then
         local detail
         detail="$("$PYTHON" -c "import json; print(json.loads('''$verify_res''').get('details', 'OK'))")"
@@ -450,7 +505,13 @@ report = {
     'strategy': '${target_strategy}',
     'runs': ${test_runs},
     'successful_runs': ${successful_runs},
-    'dispatches_recorded': ${dispatch_count},
+    'gateway_proxy_events': ${proxy_events_count},
+    'generation_attempts': ${gen_attempts_count},
+    'successful_generation_dispatches': ${gen_dispatches_count},
+    'auxiliary_gateway_events': ${aux_events_count},
+    'failovers_count': ${failovers_count},
+    'dispatches_recorded': ${gen_dispatches_count},
+    'generation_sequence': json.load(open('${TMP_DIR}/dispatches.json')),
     'verification': json.loads('''${verify_res}'''),
     'hits_delta': json.load(open('${TMP_DIR}/hits_delta.json')),
     'concurrent_traffic': json.loads('''${conc_res}'''),
