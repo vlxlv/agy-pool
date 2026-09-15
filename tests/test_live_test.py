@@ -8,6 +8,7 @@ and complete in sub-second time.
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -709,6 +710,49 @@ Refreshing quota for 1 account(s)...
             self.assertEqual(delta["successful_dispatches_count"], 0)
         finally:
             os.unlink(log_path)
+
+    def test_live_report_log_delta_dispatches_count_extraction(self):
+        """
+        Regression check: ensure live-test.sh report extraction of gen_dispatches_count
+        from log_delta.json parses and evaluates without SyntaxError.
+        """
+        sample_delta = {
+            "successful_dispatches_count": 9,
+            "generation_dispatches": ["a@example.com"] * 9,
+            "dispatches": ["a@example.com"] * 9,
+            "total_proxy_events": 155,
+            "generation_attempts_count": 9,
+            "auxiliary_events_count": 146,
+            "failovers_count": 0,
+        }
+        with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as f:
+            delta_path = f.name
+            json.dump(sample_delta, f)
+
+        try:
+            expr = (
+                f"import json; d=json.load(open(r'{delta_path}')); "
+                f"print(d.get('successful_dispatches_count', len(d.get('generation_dispatches', d.get('dispatches', [])))))"
+            )
+            out = subprocess.check_output([sys.executable, "-c", expr], text=True).strip()
+            self.assertEqual(out, "9")
+
+            # Verify fallback when successful_dispatches_count is not present
+            with open(delta_path, "w", encoding="utf-8") as f:
+                json.dump({"generation_dispatches": ["b@example.com"] * 5}, f)
+            out_fallback = subprocess.check_output([sys.executable, "-c", expr], text=True).strip()
+            self.assertEqual(out_fallback, "5")
+
+            # Also verify scripts/live-test.sh contains the exact valid python expression
+            live_test_sh = os.path.join(ROOT, "scripts", "live-test.sh")
+            with open(live_test_sh, "r", encoding="utf-8") as f:
+                sh_text = f.read()
+            self.assertIn(
+                "print(d.get('successful_dispatches_count', len(d.get('generation_dispatches', d.get('dispatches', [])))))",
+                sh_text,
+            )
+        finally:
+            os.unlink(delta_path)
 
 
 if __name__ == "__main__":

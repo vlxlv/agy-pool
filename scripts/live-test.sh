@@ -365,7 +365,7 @@ run_strategy_test() {
     local gen_attempts_count
     gen_attempts_count="$("$PYTHON" -c "import json; d=json.load(open('${TMP_DIR}/log_delta.json')); print(d.get('generation_attempts_count', len(d.get('generation_attempts', []))))")"
     local gen_dispatches_count
-    gen_dispatches_count="$("$PYTHON" -c "import json; d=json.load(open('${TMP_DIR}/log_delta.json')); print(d.get('successful_dispatches_count', len(d.get('generation_dispatches', d.get('dispatches', []))))))")"
+    gen_dispatches_count="$("$PYTHON" -c "import json; d=json.load(open('${TMP_DIR}/log_delta.json')); print(d.get('successful_dispatches_count', len(d.get('generation_dispatches', d.get('dispatches', [])))))")"
     local aux_events_count
     aux_events_count="$("$PYTHON" -c "import json; d=json.load(open('${TMP_DIR}/log_delta.json')); print(d.get('auxiliary_events_count', len(d.get('auxiliary_events', []))))")"
     local failovers_count
