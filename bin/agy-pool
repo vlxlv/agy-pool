@@ -34,22 +34,32 @@ import tempfile
 import email.utils
 from datetime import datetime, timezone
 
-try:
-    import fcntl
-    HAS_FCNTL = True
-except ImportError:
-    HAS_FCNTL = False
+# Ensure repository root is in sys.path so agy_pool can be imported
+_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+_REPO_DIR = os.path.dirname(_SCRIPT_DIR)
+if _REPO_DIR not in sys.path:
+    sys.path.insert(0, _REPO_DIR)
+
+from agy_pool import config
+from agy_pool import storage
+
+# Re-export fcntl and configuration constants / functions
+HAS_FCNTL = config.HAS_FCNTL
+fcntl = config.fcntl
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-beta.1"
-QUOTA_FRESH_MAX_AGE = 60
-QUOTA_AGING_MAX_AGE = 300
+VERSION = config.VERSION
+QUOTA_FRESH_MAX_AGE = config.QUOTA_FRESH_MAX_AGE
+QUOTA_AGING_MAX_AGE = config.QUOTA_AGING_MAX_AGE
 _QUOTA_REFRESH_LOCK = threading.Lock()
 _QUOTA_REFRESH_IN_FLIGHT = set()
 _QUOTA_REFRESH_RETRY = {}
-_QUOTA_REFRESH_BACKOFF = (30, 60, 120, 240, 300)
+_QUOTA_REFRESH_BACKOFF = config._QUOTA_REFRESH_BACKOFF
+
+
 def _decode_cred(h, k=0x5A):
     return bytes([b ^ k for b in bytes.fromhex(h)]).decode()
+
 
 _DEFAULT_CLIENT_ID = _decode_cred("6b6a6d6b6a6a6c6a6c6a6f636b772e3732292933346832686b3639283f68696f2c2e35363530326e3d6e6a693f2a743b2a2a29743d35353d363f2f293f283935342e3f342e74393537")
 _DEFAULT_CLIENT_SECRET = _decode_cred("1d1519090a0277116f621c0d086e626c163e16106b371618622902196e206c2b1e1b3c")
@@ -67,29 +77,8 @@ OAUTH_SCOPES = (
 BACKEND_HOST = "daily-cloudcode-pa.googleapis.com"
 BACKEND_URL_BASE = f"https://{BACKEND_HOST}"
 
-def resolve_gateway_port(env_val=None):
-    """
-    Resolves and validates the gateway TCP port.
-    Returns 8899 if env_val (or AGY_PORT environment variable) is unset or empty.
-    Raises ValueError on invalid string, non-integer, 0, or port > 65535.
-    """
-    raw = os.environ.get("AGY_PORT") if env_val is None else env_val
-    if raw is None or raw == "":
-        return 8899
-    try:
-        port = int(raw)
-        if 1 <= port <= 65535:
-            return port
-    except (ValueError, TypeError):
-        pass
-    raise ValueError(f"Invalid AGY_PORT '{raw}'. Must be an integer between 1 and 65535.")
-
-
-try:
-    DEFAULT_PORT = resolve_gateway_port()
-except ValueError as _e:
-    sys.stderr.write(f"[Error] {_e}\n")
-    sys.exit(1)
+resolve_gateway_port = config.resolve_gateway_port
+DEFAULT_PORT = config.DEFAULT_PORT
 
 
 def find_real_agy_binary():
@@ -141,231 +130,69 @@ INSTALLED_AGY_VER = get_installed_agy_version()
 ARCH = "arm64" if platform.machine() in ["aarch64", "arm64"] else platform.machine()
 OS_TYPE = "linux" if platform.system().lower() == "linux" else platform.system().lower()
 DEFAULT_UA = f"antigravity/cli/{INSTALLED_AGY_VER} (aidev_client; os_type={OS_TYPE}; arch={ARCH}; auth_method=consumer)"
-POOL_LOCK = threading.RLock()
-FILE_LOCKS = {}
-FILE_LOCKS_LOCK = threading.Lock()
+# Re-export storage locks
+POOL_LOCK = storage.POOL_LOCK
+FILE_LOCKS = storage.FILE_LOCKS
+FILE_LOCKS_LOCK = storage.FILE_LOCKS_LOCK
 
 # ----------------- Path Configuration & Test Isolation Guard -----------------
-_REAL_PRODUCTION_GEMINI_DIR = (
-    os.environ.get("AGY_REAL_GEMINI_DIR")
-    or os.path.abspath(os.path.expanduser("~/.gemini"))
-)
-_FORBIDDEN_WRITE_DIRS = {
-    os.path.realpath(_REAL_PRODUCTION_GEMINI_DIR),
-    os.path.abspath(os.path.expanduser(_REAL_PRODUCTION_GEMINI_DIR)),
-}
-_TEST_MODE = bool(os.environ.get("AGY_TEST_MODE") == "1")
+_REAL_PRODUCTION_GEMINI_DIR = config._REAL_PRODUCTION_GEMINI_DIR
+_FORBIDDEN_WRITE_DIRS = config._FORBIDDEN_WRITE_DIRS
+_TEST_MODE = config._TEST_MODE
+is_test_mode = config.is_test_mode
+set_test_mode = config.set_test_mode
+register_forbidden_path = config.register_forbidden_path
+_assert_safe_write_path = config._assert_safe_write_path
 
 
-def is_test_mode():
-    """Return True if running under isolated test mode."""
-    return bool(_TEST_MODE or os.environ.get("AGY_TEST_MODE") == "1")
+def _sync_paths_from_config():
+    global GEMINI_DIR, POOL_CONFIG_FILE, PID_FILE, LOG_FILE, AGY_CLI_DIR, AGY_TOKEN_FILE
+    GEMINI_DIR = config.GEMINI_DIR
+    POOL_CONFIG_FILE = config.POOL_CONFIG_FILE
+    PID_FILE = config.PID_FILE
+    LOG_FILE = config.LOG_FILE
+    AGY_CLI_DIR = config.AGY_CLI_DIR
+    AGY_TOKEN_FILE = config.AGY_TOKEN_FILE
 
 
-def set_test_mode(enabled=True):
-    """Enable or disable fail-closed test mode."""
-    global _TEST_MODE
-    _TEST_MODE = bool(enabled)
-    if enabled:
-        os.environ["AGY_TEST_MODE"] = "1"
-    else:
-        os.environ.pop("AGY_TEST_MODE", None)
-
-
-def register_forbidden_path(path):
-    """Register an additional path that must never be written to in test mode."""
-    if path:
-        p = os.path.abspath(os.path.expanduser(str(path)))
-        _FORBIDDEN_WRITE_DIRS.add(os.path.realpath(p))
-        _FORBIDDEN_WRITE_DIRS.add(p)
-
-
-def _assert_safe_write_path(path):
-    """
-    Fail-closed test guard: prevent tests from ever writing to production or protected paths.
-    Raises RuntimeError immediately if in test mode and path targets a forbidden directory.
-    """
-    if not is_test_mode() or not path:
-        return
-    try:
-        real_path = os.path.realpath(os.path.abspath(os.path.expanduser(str(path))))
-    except Exception as e:
-        raise RuntimeError(
-            f"[FAIL-CLOSED TEST GUARD] Failed to resolve path safely: {path}"
-        ) from e
-    for forbidden in _FORBIDDEN_WRITE_DIRS:
-        if real_path == forbidden or real_path.startswith(forbidden + os.sep):
-            raise RuntimeError(
-                f"[FAIL-CLOSED TEST GUARD] Refusing to write to protected path during test mode: {real_path}"
-            )
+config.register_configure_hook(_sync_paths_from_config)
+_sync_paths_from_config()
 
 
 def configure_paths(gemini_dir=None):
-    """
-    Configure runtime storage paths.
-    If gemini_dir is provided, paths are rooted at gemini_dir.
-    Otherwise, uses AGY_GEMINI_DIR environment variable or defaults to ~/.gemini.
-    Returns configured GEMINI_DIR.
-    """
-    global GEMINI_DIR, POOL_CONFIG_FILE, PID_FILE, LOG_FILE, AGY_CLI_DIR, AGY_TOKEN_FILE
-    if gemini_dir is not None:
-        base = os.path.abspath(os.path.expanduser(gemini_dir))
-    elif os.environ.get("AGY_GEMINI_DIR"):
-        base = os.path.abspath(os.path.expanduser(os.environ["AGY_GEMINI_DIR"]))
-    else:
-        base = os.path.abspath(os.path.expanduser("~/.gemini"))
-
-    if is_test_mode() and gemini_dir is not None:
-        _assert_safe_write_path(base)
-
-    GEMINI_DIR = base
-    POOL_CONFIG_FILE = os.path.join(GEMINI_DIR, "agy-pool-accounts.json")
-    PID_FILE = os.path.join(GEMINI_DIR, "agy-pool.pid")
-    LOG_FILE = os.path.join(GEMINI_DIR, "agy-pool.log")
-    AGY_CLI_DIR = os.path.join(GEMINI_DIR, "antigravity-cli")
-    AGY_TOKEN_FILE = os.path.join(AGY_CLI_DIR, "antigravity-oauth-token")
-    return GEMINI_DIR
+    res = config.configure_paths(gemini_dir)
+    _sync_paths_from_config()
+    return res
 
 
-# Initialize default paths from environment or default location
-configure_paths()
-DEFAULT_MAX_LOG_BYTES = 5 * 1024 * 1024  # 5 MB
-DEFAULT_BACKUP_LOG_COUNT = 1
-MAX_LOG_BYTES = int(os.environ.get("AGY_LOG_MAX_BYTES", DEFAULT_MAX_LOG_BYTES))
-BACKUP_LOG_COUNT = int(os.environ.get("AGY_LOG_BACKUP_COUNT", DEFAULT_BACKUP_LOG_COUNT))
+DEFAULT_MAX_LOG_BYTES = config.DEFAULT_MAX_LOG_BYTES
+DEFAULT_BACKUP_LOG_COUNT = config.DEFAULT_BACKUP_LOG_COUNT
+MAX_LOG_BYTES = config.MAX_LOG_BYTES
+BACKUP_LOG_COUNT = config.BACKUP_LOG_COUNT
 
 # ANSI Color Codes
-CLR_RESET = "\033[0m"
-CLR_BOLD = "\033[1m"
-CLR_DIM = "\033[2m"
-CLR_GREEN = "\033[32m"
-CLR_YELLOW = "\033[33m"
-CLR_BLUE = "\033[34m"
-CLR_MAGENTA = "\033[35m"
-CLR_CYAN = "\033[36m"
-CLR_RED = "\033[31m"
+CLR_RESET = config.CLR_RESET
+CLR_BOLD = config.CLR_BOLD
+CLR_DIM = config.CLR_DIM
+CLR_GREEN = config.CLR_GREEN
+CLR_YELLOW = config.CLR_YELLOW
+CLR_BLUE = config.CLR_BLUE
+CLR_MAGENTA = config.CLR_MAGENTA
+CLR_CYAN = config.CLR_CYAN
+CLR_RED = config.CLR_RED
 
-
-def ensure_dirs():
-    _assert_safe_write_path(GEMINI_DIR)
-    _assert_safe_write_path(AGY_CLI_DIR)
-    os.makedirs(GEMINI_DIR, mode=0o700, exist_ok=True)
-    os.makedirs(AGY_CLI_DIR, mode=0o700, exist_ok=True)
-
-
-# ----------------- Account Storage -----------------
-def _empty_pool():
-    return {
-        "version": 1,
-        "strategy": "max_quota",  # max_quota | round_robin
-        "active_account_id": None,
-        "accounts": []
-    }
-
-
-def _thread_file_lock(path):
-    with FILE_LOCKS_LOCK:
-        return FILE_LOCKS.setdefault(path, threading.RLock())
-
-
-@contextlib.contextmanager
-def _file_lock(path, exclusive=True, blocking=True):
-    """Lock a stable sidecar inode across both threads and POSIX processes."""
-    _assert_safe_write_path(path)
-    thread_lock = _thread_file_lock(path)
-    if not thread_lock.acquire(blocking=blocking):
-        raise BlockingIOError("lock is already held")
-    try:
-        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            if HAS_FCNTL:
-                operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-                if not blocking:
-                    operation |= fcntl.LOCK_NB
-                fcntl.flock(fd, operation)
-            yield
-        finally:
-            if HAS_FCNTL:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
-    finally:
-        thread_lock.release()
-
-
-def _read_pool_unlocked():
-    if not os.path.exists(POOL_CONFIG_FILE):
-        return _empty_pool()
-    with open(POOL_CONFIG_FILE, "r", encoding="utf-8") as f:
-        pool = json.load(f)
-    if not isinstance(pool, dict) or not isinstance(pool.get("accounts"), list):
-        raise ValueError("pool state must be an object containing an accounts list")
-    return pool
-
-
-def _atomic_json_write(path, data):
-    _assert_safe_write_path(path)
-    directory = os.path.dirname(path)
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-        try:
-            dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            pass
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-
-
-def load_pool():
-    ensure_dirs()
-    try:
-        with POOL_LOCK, _file_lock(POOL_CONFIG_FILE + ".lock", exclusive=False):
-            return _read_pool_unlocked()
-    except Exception as e:
-        sys.stderr.write(f"{CLR_RED}[Error] Failed to read {POOL_CONFIG_FILE}: {e}{CLR_RESET}\n")
-        return _empty_pool()
-
-
-def pool_transaction(mutator):
-    """Run one read-modify-write transaction against the JSON pool."""
-    ensure_dirs()
-    with POOL_LOCK, _file_lock(POOL_CONFIG_FILE + ".lock"):
-        pool = _read_pool_unlocked()  # Corrupt state aborts; it is never replaced with an empty pool.
-        result = mutator(pool)
-        _atomic_json_write(POOL_CONFIG_FILE, pool)
-        return result
-
-
-def save_pool(data):
-    """Replace the pool under the transaction lock; retained for compatibility."""
-    def replace(pool):
-        pool.clear()
-        pool.update(data)
-    pool_transaction(replace)
-
-
-def _find_account(pool, account):
-    account_id = account.get("id")
-    email = account.get("email")
-    return next((a for a in pool.get("accounts", [])
-                 if (account_id and a.get("id") == account_id) or
-                    (email and a.get("email") == email)), None)
+# ----------------- Account Storage Primitives -----------------
+ensure_dirs = storage.ensure_dirs
+_empty_pool = storage._empty_pool
+_thread_file_lock = storage._thread_file_lock
+_file_lock = storage._file_lock
+_read_pool_unlocked = storage._read_pool_unlocked
+_atomic_json_write = storage._atomic_json_write
+load_pool = storage.load_pool
+pool_transaction = storage.pool_transaction
+save_pool = storage.save_pool
+_find_account = storage._find_account
+_next_account_id = storage._next_account_id
 
 
 def display_account_name(account):
@@ -409,13 +236,6 @@ def _persist_account_fields(account, fields):
                 stored.pop(k, None)
     pool_transaction(update)
 
-
-def _next_account_id(accounts):
-    used = {a.get("id") for a in accounts}
-    number = 1
-    while f"acc_{number}" in used:
-        number += 1
-    return f"acc_{number}"
 
 
 # ----------------- OAuth & Token Utilities -----------------

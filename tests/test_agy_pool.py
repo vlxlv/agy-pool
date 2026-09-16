@@ -12,6 +12,7 @@ import os
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -23,8 +24,13 @@ from unittest import mock
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from agy_pool import config, storage
+
 SCRIPT = os.path.join(ROOT, "bin", "agy-pool")
-loader = importlib.machinery.SourceFileLoader("agy_pool", SCRIPT)
+loader = importlib.machinery.SourceFileLoader("agy_pool_bin", SCRIPT)
 spec = importlib.util.spec_from_loader(loader.name, loader)
 agy_pool = importlib.util.module_from_spec(spec)
 loader.exec_module(agy_pool)
@@ -99,8 +105,8 @@ class AgyPoolTest(unittest.TestCase):
         gemini = os.path.join(self.temp.name, ".gemini")
 
         # Capture prior state before configuring isolated environment
-        orig_gemini_dir = agy_pool.GEMINI_DIR
-        orig_test_mode = agy_pool.is_test_mode()
+        orig_gemini_dir = config.GEMINI_DIR
+        orig_test_mode = config.is_test_mode()
 
         self.env_patch = mock.patch.dict(os.environ, {
             "HOME": self.temp.name,
@@ -111,12 +117,13 @@ class AgyPoolTest(unittest.TestCase):
         self.addCleanup(self.env_patch.stop)
 
         # Explicitly configure isolated storage paths and enable fail-closed test guard
-        agy_pool.configure_paths(gemini)
-        agy_pool.set_test_mode(True)
+        # via authoritative configuration module
+        config.configure_paths(gemini)
+        config.set_test_mode(True)
 
         def _restore_state():
-            agy_pool.set_test_mode(orig_test_mode)
-            agy_pool.configure_paths(orig_gemini_dir)
+            config.set_test_mode(orig_test_mode)
+            config.configure_paths(orig_gemini_dir)
         self.addCleanup(_restore_state)
 
         agy_pool.FILE_LOCKS.clear()
@@ -2554,6 +2561,145 @@ class AgyPoolTest(unittest.TestCase):
                 agy_pool._assert_safe_write_path("/any/path")
         finally:
             agy_pool.set_test_mode(True)
+
+    def test_cp1_modularization_config_and_storage_extraction(self):
+        """Verify CP1 extraction: config.py, storage.py, safety invariants, and compatibility."""
+        # A. configure_paths()
+        custom_gemini = os.path.join(self.temp.name, "custom_gemini")
+        returned = config.configure_paths(custom_gemini)
+        self.assertEqual(returned, custom_gemini)
+        self.assertEqual(config.GEMINI_DIR, custom_gemini)
+        self.assertEqual(config.POOL_CONFIG_FILE, os.path.join(custom_gemini, "agy-pool-accounts.json"))
+        self.assertEqual(config.PID_FILE, os.path.join(custom_gemini, "agy-pool.pid"))
+        self.assertEqual(config.LOG_FILE, os.path.join(custom_gemini, "agy-pool.log"))
+        self.assertEqual(config.AGY_CLI_DIR, os.path.join(custom_gemini, "antigravity-cli"))
+        self.assertEqual(config.AGY_TOKEN_FILE, os.path.join(custom_gemini, "antigravity-cli", "antigravity-oauth-token"))
+        # Verify bin/agy-pool re-export is synchronized via the hook
+        self.assertEqual(agy_pool.GEMINI_DIR, custom_gemini)
+        self.assertEqual(agy_pool.POOL_CONFIG_FILE, config.POOL_CONFIG_FILE)
+        self.assertEqual(agy_pool.PID_FILE, config.PID_FILE)
+        self.assertEqual(agy_pool.LOG_FILE, config.LOG_FILE)
+        # Restore test gemini dir
+        current_test_gemini = os.path.join(self.temp.name, ".gemini")
+        config.configure_paths(current_test_gemini)
+
+        # B. load_pool()
+        if os.path.exists(config.POOL_CONFIG_FILE):
+            os.unlink(config.POOL_CONFIG_FILE)
+        empty = storage.load_pool()
+        self.assertEqual(empty, {"version": 1, "strategy": "max_quota", "active_account_id": None, "accounts": []})
+        self.assertEqual(agy_pool.load_pool(), empty)
+
+        # C. save_pool()
+        test_data = {
+            "version": 1,
+            "strategy": "round_robin",
+            "active_account_id": "acc_1",
+            "accounts": [account("acc_1")],
+        }
+        storage.save_pool(test_data)
+        self.assertTrue(os.path.exists(config.POOL_CONFIG_FILE))
+        perm = oct(os.stat(config.POOL_CONFIG_FILE).st_mode & 0o777)
+        self.assertEqual(perm, "0o600")
+        loaded = storage.load_pool()
+        self.assertEqual(loaded["active_account_id"], "acc_1")
+        self.assertEqual(agy_pool.load_pool()["active_account_id"], "acc_1")
+
+        # D. pool_transaction()
+        def add_acc_2(p):
+            p["accounts"].append(account("acc_2"))
+            return len(p["accounts"])
+        count = storage.pool_transaction(add_acc_2)
+        self.assertEqual(count, 2)
+        self.assertEqual(len(storage.load_pool()["accounts"]), 2)
+        # Verify corrupt JSON causes pool_transaction to abort, not overwrite
+        with open(config.POOL_CONFIG_FILE, "w", encoding="utf-8") as f:
+            f.write("{corrupt json")
+        with self.assertRaises(Exception):
+            storage.pool_transaction(lambda p: p)
+        # File still contains the corrupt content, was not replaced with empty pool
+        with open(config.POOL_CONFIG_FILE, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "{corrupt json")
+        # Clean up corrupt file
+        os.unlink(config.POOL_CONFIG_FILE)
+        storage.save_pool(test_data)
+
+        # E. file locking
+        lock_path = os.path.join(current_test_gemini, "test_file.lock")
+        with storage._file_lock(lock_path):
+            self.assertTrue(os.path.exists(lock_path))
+            # Test non-blocking contention on the same file from a separate thread
+            contended = []
+            def try_lock():
+                try:
+                    with storage._file_lock(lock_path, blocking=False):
+                        contended.append("acquired")
+                except BlockingIOError:
+                    contended.append("blocked")
+            t = threading.Thread(target=try_lock)
+            t.start()
+            t.join()
+            self.assertEqual(contended, ["blocked"])
+
+        # F. atomic JSON write
+        json_target = os.path.join(current_test_gemini, "atomic_test.json")
+        storage._atomic_json_write(json_target, {"hello": "world"})
+        self.assertTrue(os.path.exists(json_target))
+        self.assertEqual(oct(os.stat(json_target).st_mode & 0o777), "0o600")
+        with open(json_target, "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"hello": "world"})
+
+        # G. account lookup
+        pool_sample = {
+            "accounts": [
+                {"id": "acc_1", "email": "a@example.com"},
+                {"id": "acc_2", "email": "b@example.com"},
+            ]
+        }
+        self.assertEqual(storage._find_account(pool_sample, {"id": "acc_1"})["email"], "a@example.com")
+        self.assertEqual(storage._find_account(pool_sample, {"email": "b@example.com"})["id"], "acc_2")
+        self.assertIsNone(storage._find_account(pool_sample, {"id": "acc_3"}))
+        self.assertEqual(agy_pool._find_account(pool_sample, {"id": "acc_1"})["email"], "a@example.com")
+
+        # H. next account ID
+        self.assertEqual(storage._next_account_id([]), "acc_1")
+        self.assertEqual(storage._next_account_id([{"id": "acc_1"}, {"id": "acc_2"}]), "acc_3")
+        self.assertEqual(storage._next_account_id([{"id": "acc_1"}, {"id": "acc_3"}]), "acc_2")
+        self.assertEqual(agy_pool._next_account_id([]), "acc_1")
+
+        # I. production-path fail-closed guard
+        self.assertTrue(config.is_test_mode())
+        prod_gemini = config._REAL_PRODUCTION_GEMINI_DIR
+        with self.assertRaises(RuntimeError) as cm_guard:
+            config._assert_safe_write_path(os.path.join(prod_gemini, "agy-pool-accounts.json"))
+        self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_guard.exception))
+        with self.assertRaises(RuntimeError):
+            storage._atomic_json_write(os.path.join(prod_gemini, "test.json"), {})
+        with self.assertRaises(RuntimeError):
+            with storage._file_lock(os.path.join(prod_gemini, "test.lock")):
+                pass
+
+        # J. PID/log/path isolation regression tests
+        self.assertFalse(config.PID_FILE.startswith(prod_gemini))
+        self.assertFalse(config.LOG_FILE.startswith(prod_gemini))
+        self.assertTrue(config.PID_FILE.startswith(self.temp.name))
+        self.assertTrue(config.LOG_FILE.startswith(self.temp.name))
+        self.assertEqual(agy_pool.PID_FILE, config.PID_FILE)
+        self.assertEqual(agy_pool.LOG_FILE, config.LOG_FILE)
+
+        # K. fcntl available path
+        if config.HAS_FCNTL:
+            self.assertIsNotNone(config.fcntl)
+            self.assertTrue(hasattr(config.fcntl, "flock"))
+            flock_target = os.path.join(current_test_gemini, "flock_test.lock")
+            with storage._file_lock(flock_target):
+                self.assertTrue(os.path.exists(flock_target))
+
+        # L. non-fcntl fallback if already testable
+        with mock.patch.object(config, "HAS_FCNTL", False), mock.patch.object(config, "fcntl", None):
+            fallback_target = os.path.join(current_test_gemini, "fallback_test.lock")
+            with storage._file_lock(fallback_target):
+                self.assertTrue(os.path.exists(fallback_target))
 
 
 if __name__ == "__main__":
