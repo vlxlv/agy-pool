@@ -2094,6 +2094,330 @@ class AgyPoolTest(unittest.TestCase):
         self.assertNotIn("bob_ops", out_rm_name)
         self.assertEqual(len(agy_pool.load_pool()["accounts"]), 0)
 
+    def test_backward_compatibility_alpha_9_state(self):
+        """
+        Backward-compatibility gate: alpha.9-style pool state.
+        Older account entries lack:
+          - gemini_weekly
+          - quota freshness timestamps (updated_at)
+          - known-window flags
+          - friendly display names ('name' field is None or missing)
+        Expected:
+          - pool loads successfully
+          - accounts remain usable
+          - no migration subsystem required
+          - no account deleted or rewritten incorrectly
+          - missing friendly name displays as Account N
+        """
+        alpha_9_pool = {
+            "version": 1,
+            "strategy": "least_used",
+            "active_account_id": "acc_1",
+            "accounts": [
+                {
+                    "id": "acc_1",
+                    "email": "alpha9_user1@example.com",
+                    "refresh_token": "mock_rf_1",
+                    "access_token": "mock_at_1",
+                    "token_expiry": 1726000000,
+                    "request_count": 20,
+                    "gen_count": 8,
+                    "created_at": 1725000000,
+                    "last_quota": {
+                        "remaining_fraction": 0.85,
+                        "reset_time": 1726050000,
+                    },
+                },
+                {
+                    "id": "acc_2",
+                    "email": "alpha9_user2@example.com",
+                    "refresh_token": "mock_rf_2",
+                    "access_token": "mock_at_2",
+                    "token_expiry": 1726000000,
+                    "request_count": 5,
+                    "gen_count": 2,
+                    "created_at": 1725000000,
+                    "last_quota": {
+                        "remaining_fraction": 0.40,
+                    },
+                },
+            ],
+        }
+        os.makedirs(agy_pool.GEMINI_DIR, exist_ok=True)
+        with open(agy_pool.POOL_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(alpha_9_pool, f)
+
+        # 1. Pool loads successfully
+        pool = agy_pool.load_pool()
+        self.assertEqual(len(pool["accounts"]), 2)
+        self.assertEqual(pool["active_account_id"], "acc_1")
+        self.assertEqual(pool["strategy"], "least_used")
+
+        # 2. Display rendering uses Account N and never exposes email
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=None), \
+             mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.list_accounts()
+        out = buf.getvalue()
+        self.assertIn("[1] Account 1", out)
+        self.assertIn("[2] Account 2", out)
+        self.assertNotIn("alpha9_user1@example.com", out)
+        self.assertNotIn("alpha9_user2@example.com", out)
+        self.assertIn("Hits: 8", out)
+        self.assertIn("Hits: 2", out)
+
+        # 3. Capacity calculation handles missing weekly and missing updated_at
+        cap1 = agy_pool.compute_capacity_state(pool["accounts"][0])
+        self.assertEqual(cap1["known_window_count"], 1)
+        self.assertAlmostEqual(cap1["raw_floor"], 0.85, places=4)
+        self.assertEqual(agy_pool.quota_freshness(pool["accounts"][0])["class"], "unknown")  # missing updated_at
+
+        # 4. Scheduling operates correctly across all strategies
+        ordered_lu = agy_pool.order_candidates(pool["accounts"], strategy="least_used")
+        self.assertEqual([x["id"] for x in ordered_lu], ["acc_2", "acc_1"])
+
+        ordered_mq = agy_pool.order_candidates(pool["accounts"], strategy="max_quota")
+        self.assertEqual([x["id"] for x in ordered_mq], ["acc_1", "acc_2"])
+
+        # 5. Accounts are preserved without data loss after save
+        agy_pool.save_pool(pool)
+        reloaded = agy_pool.load_pool()
+        self.assertEqual(len(reloaded["accounts"]), 2)
+        self.assertEqual(reloaded["accounts"][0]["email"], "alpha9_user1@example.com")
+        self.assertEqual(reloaded["accounts"][1]["email"], "alpha9_user2@example.com")
+
+    def test_backward_compatibility_alpha_10_state(self):
+        """
+        Backward-compatibility gate: alpha.10-style pool state.
+        Expected:
+          - existing last_quota structures load
+          - remaining_fraction legacy fallback still works
+          - partial/unknown semantics remain compatible
+          - friendly names render where available, Account N fallback otherwise
+        """
+        alpha_10_pool = {
+            "version": 1,
+            "strategy": "max_quota",
+            "active_account_id": "acc_1",
+            "accounts": [
+                {
+                    "id": "acc_1",
+                    "name": "Production Node",
+                    "email": "node1@example.com",
+                    "refresh_token": "rf_1",
+                    "access_token": "at_1",
+                    "token_expiry": 1726450000,
+                    "updated_at": time.time(),
+                    "gen_count": 10,
+                    "last_quota": {
+                        "updated_at": time.time(),
+                        "gemini_5h": {"fraction": 0.90, "reset_time": time.time() + 18000},
+                        "gemini_weekly": {"fraction": 0.95, "reset_time": time.time() + 600000},
+                    },
+                },
+                {
+                    "id": "acc_2",
+                    "email": "node2@example.com",
+                    "refresh_token": "rf_2",
+                    "access_token": "at_2",
+                    "token_expiry": 1726450000,
+                    "gen_count": 3,
+                    "last_quota": {
+                        "gemini_5h": {"fraction": 0.60},
+                    },
+                },
+                {
+                    "id": "acc_3",
+                    "email": "node3@example.com",
+                    "refresh_token": "rf_3",
+                    "access_token": "at_3",
+                    "token_expiry": 1726450000,
+                    "gen_count": 1,
+                    "last_quota": {
+                        "gemini_5h": {"fraction": 0.002, "reset_time": time.time() + 3600},
+                        "gemini_weekly": {"fraction": 0.90, "reset_time": time.time() + 500000},
+                    },
+                },
+            ],
+        }
+        os.makedirs(agy_pool.GEMINI_DIR, exist_ok=True)
+        with open(agy_pool.POOL_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(alpha_10_pool, f)
+
+        pool = agy_pool.load_pool()
+        self.assertEqual(len(pool["accounts"]), 3)
+
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=None), \
+             mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.list_accounts()
+        out = buf.getvalue()
+
+        self.assertIn("[1] Production Node", out)
+        self.assertIn("[2] Account 2", out)
+        self.assertIn("[3] Account 3", out)
+        self.assertIn("Exhausted", out)  # acc_3 <= 0.005
+        self.assertNotIn("node1@example.com", out)
+        self.assertNotIn("node2@example.com", out)
+        self.assertNotIn("node3@example.com", out)
+
+        # Quota confidence & capacity checks
+        cap1 = agy_pool.compute_capacity_state(pool["accounts"][0])
+        self.assertEqual(cap1["known_window_count"], 2)
+        self.assertEqual(agy_pool.quota_freshness(pool["accounts"][0])["class"], "fresh")
+
+        cap2 = agy_pool.compute_capacity_state(pool["accounts"][1])
+        self.assertEqual(cap2["known_window_count"], 1)
+
+        cap3 = agy_pool.compute_capacity_state(pool["accounts"][2])
+        self.assertTrue(cap3["is_depleted"])
+
+        ordered = agy_pool.order_candidates(pool["accounts"], strategy="max_quota")
+        # Healthy dual-window acc_1 ranks top, depleted acc_3 ranks lowest
+        self.assertEqual(ordered[0]["id"], "acc_1")
+        self.assertEqual(ordered[-1]["id"], "acc_3")
+
+    def test_installer_and_upgrade_lifecycle(self):
+        """
+        Installer / upgrade gate:
+        - Fresh install
+        - Upgrade over existing install (idempotent, no duplicate aliases)
+        - Uninstall (cleans binaries & aliases, preserves pool data)
+        - Reinstall
+        """
+        fake_home = os.path.join(self.temp.name, "fake_home")
+        os.makedirs(fake_home, exist_ok=True)
+        bashrc = os.path.join(fake_home, ".bashrc")
+        with open(bashrc, "w", encoding="utf-8") as f:
+            f.write("# existing bashrc content\nexport FOO=bar\n")
+
+        # Create dummy pool data before install
+        gemini_dir = os.path.join(fake_home, ".gemini")
+        os.makedirs(gemini_dir, exist_ok=True)
+        pool_file = os.path.join(gemini_dir, "agy-pool-accounts.json")
+        with open(pool_file, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "accounts": [{"id": "acc_keep", "email": "keep@example.com"}]}, f)
+
+        repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        install_script = os.path.join(repo_dir, "install.sh")
+        uninstall_script = os.path.join(repo_dir, "uninstall.sh")
+
+        env = dict(os.environ, HOME=fake_home, PREFIX="")
+        # 1. Fresh install
+        proc = subprocess.run(["bash", install_script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc.returncode, 0, f"install.sh failed: {proc.stderr}")
+
+        bin_dir = os.path.join(fake_home, ".local", "bin")
+        self.assertTrue(os.path.islink(os.path.join(bin_dir, "agy-pool")))
+        self.assertTrue(os.path.islink(os.path.join(bin_dir, "agy-raw")))
+        self.assertTrue(os.path.islink(os.path.join(bin_dir, "agy-orig")))
+
+        with open(bashrc, "r", encoding="utf-8") as f:
+            bashrc_content = f.read()
+        self.assertEqual(bashrc_content.count("# >>> agy-pool integration >>>"), 1)
+        self.assertIn("alias agy='agy-pool run'", bashrc_content)
+
+        # 2. Upgrade (re-run install.sh)
+        proc_up = subprocess.run(["bash", install_script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc_up.returncode, 0, f"install.sh upgrade failed: {proc_up.stderr}")
+        with open(bashrc, "r", encoding="utf-8") as f:
+            bashrc_content_up = f.read()
+        self.assertEqual(bashrc_content_up.count("# >>> agy-pool integration >>>"), 1, "Duplicate alias block introduced during upgrade")
+
+        # Verify pool file preserved
+        with open(pool_file, "r", encoding="utf-8") as f:
+            pool_data = json.load(f)
+        self.assertEqual(pool_data["accounts"][0]["id"], "acc_keep")
+
+        # 3. Uninstall
+        proc_un = subprocess.run(["bash", uninstall_script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc_un.returncode, 0, f"uninstall.sh failed: {proc_un.stderr}")
+
+        self.assertFalse(os.path.exists(os.path.join(bin_dir, "agy-pool")))
+        self.assertFalse(os.path.exists(os.path.join(bin_dir, "agy-raw")))
+        self.assertFalse(os.path.exists(os.path.join(bin_dir, "agy-orig")))
+
+        with open(bashrc, "r", encoding="utf-8") as f:
+            bashrc_clean = f.read()
+        self.assertNotIn("agy-pool integration", bashrc_clean)
+
+        # Pool file must still be preserved
+        self.assertTrue(os.path.exists(pool_file))
+        with open(pool_file, "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["accounts"][0]["id"], "acc_keep")
+
+    def test_daemon_restart_and_recovery_preserves_state(self):
+        """
+        Daemon restart / recovery gate:
+        Verify that daemon restart does not reset quota snapshot,
+        preserves friendly names, and keeps cooldown state intact.
+        """
+        cooldown_target = time.time() + 1200
+        now = time.time()
+        pool_state = {
+            "version": 1,
+            "strategy": "round_robin",
+            "active_account_id": "acc_1",
+            "accounts": [
+                {
+                    "id": "acc_1",
+                    "name": "Workstation Alpha",
+                    "email": "alpha@example.com",
+                    "refresh_token": "rf_1",
+                    "access_token": "at_1",
+                    "token_expiry": now + 3600,
+                    "updated_at": now - 30,
+                    "last_quota": {
+                        "gemini_5h": {"fraction": 0.72, "reset_time": now + 7200},
+                        "gemini_weekly": {"fraction": 0.88, "reset_time": now + 86400},
+                    },
+                },
+                {
+                    "id": "acc_2",
+                    "name": "Standby Beta",
+                    "email": "beta@example.com",
+                    "refresh_token": "rf_2",
+                    "access_token": "at_2",
+                    "token_expiry": now + 3600,
+                    "rate_limited_until": cooldown_target,
+                    "updated_at": now - 50,
+                    "last_quota": {
+                        "gemini_5h": {"fraction": 0.40, "reset_time": now + 1800},
+                        "gemini_weekly": {"fraction": 0.60, "reset_time": now + 86400},
+                    },
+                },
+            ],
+        }
+        os.makedirs(agy_pool.GEMINI_DIR, exist_ok=True)
+        with open(agy_pool.POOL_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(pool_state, f)
+
+        # Simulate restart sequence (ensure_daemon_running / reload)
+        with mock.patch.object(agy_pool, "is_daemon_running", return_value=True), \
+             mock.patch.object(agy_pool, "is_daemon_outdated", return_value=True), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=9999), \
+             mock.patch.object(agy_pool, "stop_proxy_daemon") as mock_stop, \
+             mock.patch.object(agy_pool, "start_proxy_daemon") as mock_start, \
+             mock.patch("time.sleep"):
+            agy_pool.ensure_daemon_running()
+            mock_stop.assert_called_once()
+            mock_start.assert_called_once_with(foreground=False)
+
+        # Verify state integrity after simulated restart
+        reloaded = agy_pool.load_pool()
+        acc1 = reloaded["accounts"][0]
+        acc2 = reloaded["accounts"][1]
+
+        self.assertEqual(acc1["name"], "Workstation Alpha")
+        self.assertEqual(acc1["last_quota"]["gemini_5h"]["fraction"], 0.72)
+        self.assertEqual(acc1["last_quota"]["gemini_weekly"]["fraction"], 0.88)
+
+        self.assertEqual(acc2["name"], "Standby Beta")
+        self.assertEqual(acc2["rate_limited_until"], cooldown_target)
+        self.assertEqual(acc2["last_quota"]["gemini_5h"]["fraction"], 0.40)
+
 
 if __name__ == "__main__":
     unittest.main()

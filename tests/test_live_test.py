@@ -570,8 +570,8 @@ Refreshing quota for 1 account(s)...
         with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as f:
             log_path = f.name
             for ep in aux_endpoints:
-                f.write(f"[2026-09-15 13:44:34] [PROXY] POST {ep} -> zhangy0623@gmail.com (Status: 200)\n")
-            f.write("[2026-09-15 13:44:35] [PROXY] POST v1internal:streamGenerateContent?alt=sse -> solaris18990@gmail.com (Status: 200)\n")
+                f.write(f"[2026-09-15 13:44:34] [PROXY] POST {ep} -> test-aux@example.com (Status: 200)\n")
+            f.write("[2026-09-15 13:44:35] [PROXY] POST v1internal:streamGenerateContent?alt=sse -> test-gen@example.com (Status: 200)\n")
             f.flush()
 
         try:
@@ -580,8 +580,8 @@ Refreshing quota for 1 account(s)...
             self.assertEqual(delta["auxiliary_events_count"], 15)
             self.assertEqual(delta["generation_attempts_count"], 1)
             self.assertEqual(delta["successful_dispatches_count"], 1)
-            self.assertEqual(delta["generation_dispatches"], ["solaris18990@gmail.com"])
-            self.assertEqual(delta["dispatches"], ["solaris18990@gmail.com"])
+            self.assertEqual(delta["generation_dispatches"], ["test-gen@example.com"])
+            self.assertEqual(delta["dispatches"], ["test-gen@example.com"])
             self.assertEqual(len(delta["failovers"]), 0)
 
             # Concurrency check must ignore auxiliary traffic and evaluate to CLEAN
@@ -592,7 +592,7 @@ Refreshing quota for 1 account(s)...
             self.assertFalse(conc["is_inconclusive"])
 
             # Verify scheduler uses the single generation dispatch
-            accounts = [{"email": "solaris18990@gmail.com", "quota": 1.0, "is_eligible": True}]
+            accounts = [{"email": "test-gen@example.com", "quota": 1.0, "is_eligible": True}]
             res = verify_max_quota(delta["generation_dispatches"], accounts)
             self.assertTrue(res["passed"])
         finally:
@@ -816,7 +816,7 @@ Refreshing quota for 1 account(s)...
 
     def test_traffic_classification_case1_clean(self):
         """Case 1: 1 outer invocation, 1 generation dispatch -> CLEAN"""
-        conc = detect_concurrent_activity(1, ["zhangy0623@gmail.com"], {"total_delta": 1, "gcd": 1})
+        conc = detect_concurrent_activity(1, ["test-primary@example.com"], {"total_delta": 1, "gcd": 1})
         self.assertEqual(conc["status"], "CLEAN")
         self.assertFalse(conc["concurrent_detected"])
         self.assertFalse(conc["is_inconclusive"])
@@ -826,7 +826,7 @@ Refreshing quota for 1 account(s)...
         Case 2: 1 outer invocation, 2 generation dispatches, no explicit external marker/evidence
         -> Expected: INTERNAL_MULTIDISPATCH (must NOT be CONCURRENT).
         """
-        dispatches = ["pixelzen32@gmail.com", "pixelzen32@gmail.com"]
+        dispatches = ["test-multi@example.com", "test-multi@example.com"]
         hits_delta = {"total_delta": 2, "gcd": 2}
         conc = detect_concurrent_activity(1, dispatches, hits_delta)
         self.assertEqual(conc["status"], "INTERNAL_MULTIDISPATCH")

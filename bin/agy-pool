@@ -41,7 +41,7 @@ except ImportError:
     HAS_FCNTL = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-alpha.10"
+VERSION = "0.1.0-beta.1"
 QUOTA_FRESH_MAX_AGE = 60
 QUOTA_AGING_MAX_AGE = 300
 _QUOTA_REFRESH_LOCK = threading.Lock()
@@ -662,10 +662,14 @@ def format_remaining_time(iso_reset_time):
     if not iso_reset_time:
         return "N/A"
     try:
-        clean_time = iso_reset_time.replace("Z", "+00:00")
-        target_dt = datetime.fromisoformat(clean_time)
-        now_dt = datetime.now(timezone.utc)
-        diff_sec = int((target_dt - now_dt).total_seconds())
+        if isinstance(iso_reset_time, (int, float)):
+            diff_sec = int(iso_reset_time - time.time())
+        else:
+            clean_time = str(iso_reset_time).replace("Z", "+00:00")
+            target_dt = datetime.fromisoformat(clean_time)
+            now_dt = datetime.now(timezone.utc)
+            diff_sec = int((target_dt - now_dt).total_seconds())
+
         if diff_sec <= 0:
             return "Ready"
         days, rem = divmod(diff_sec, 86400)
@@ -677,7 +681,7 @@ def format_remaining_time(iso_reset_time):
             return f"in {hours}h {minutes}m"
         return f"in {minutes}m"
     except Exception:
-        return iso_reset_time[:16]
+        return str(iso_reset_time)[:16]
 
 
 def render_progress_bar(fraction, width=10):

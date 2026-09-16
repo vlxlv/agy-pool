@@ -5,6 +5,40 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.1] - 2026-09-16
+
+### Added
+- **Account Privacy & Friendly Display Names**:
+  - Replaced account email exposure across CLI tables, doctor diagnostics, logs, and live-test outputs with custom friendly names (`agy-pool rename`) or safe anonymous fallbacks (`Account 1`, `Account 2`, ...).
+  - Preserved internal account ID stability and email matching for authentication, token refresh, and manual CLI targeting.
+- **Reset-Aware 5H + Weekly Quota Scheduling**:
+  - Unified capacity scoring incorporating both Gemini 5-hour and 7-day weekly reset horizons (`worst_pace`, `total_pace`, `raw_floor`).
+  - Quota freshness classification (`fresh`, `aging`, `stale`, `unknown`) to prevent stale snapshot distortion during candidate ranking.
+  - Partial and unknown quota correctness ensuring legacy and single-window accounts participate safely without ungrounded assumption of full capacity.
+- **Quota Freshness, Asynchronous Refresh & Retry Backoff**:
+  - Background asynchronous quota refresh with single-flight deduplication and exponential retry backoff under upstream failures.
+- **Multi-Strategy Load Balancing Engine**:
+  - Comprehensive support for `max_quota` (reset-aware pace headroom), `least_used` (Hits-first distribution with quota capacity tie-breaking), and `round_robin` (cyclic rotation).
+- **Manual Live Scheduler Validation Harness**:
+  - Offline parser regression test suite and manual VPS/Linux live-test harness (`scripts/live-test.sh`, `scripts/live_test.py`) validating real gateway routing, concurrent multi-dispatch, and failover without automated CI quota consumption.
+- **Installer, Upgrade & Diagnostics Improvements**:
+  - Idempotent `install.sh` and `uninstall.sh` lifecycle managing global symlinks and shell integration (`~/.bashrc`, `~/.zshrc`).
+  - System diagnostics (`agy-pool doctor`) validating runtime environment, process concurrency, credentials, and TLS connectivity.
+  - Backward-compatibility and lifecycle tests guaranteeing safe migration from alpha states and state preservation across daemon hot-reloads.
+
+### Changed
+- Promoted `agy-pool` to its first beta release candidate (`v0.1.0-beta.1`).
+- Hardened `format_remaining_time` to reliably handle numeric epoch timestamps and ISO 8601 strings without type errors.
+
+### Fixed
+- Fixed race conditions during concurrent request selection in `round_robin` by advancing cursor atomically during transaction.
+- Fixed premature score truncation in `max_quota` scheduling.
+- Fixed sensitive email exposure in CLI listings, daemon logs, doctor outputs, and test logs.
+
+### Known Beta Limitations
+- Quota metrics reflect upstream snapshot timestamps rather than local in-flight consumption estimation.
+- Live scheduler integration tests require live Google credentials and manual invocation; standard CI remains strictly offline.
+
 ## [0.1.0-alpha.10] - 2026-09-15
 
 ### Added
