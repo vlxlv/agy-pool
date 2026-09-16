@@ -9,5 +9,6 @@ from agy_pool import auth
 from agy_pool import accounts
 from agy_pool import quota
 from agy_pool import scheduler
+from agy_pool import proxy
 
-__all__ = ["config", "storage", "auth", "accounts", "quota", "scheduler"]
+__all__ = ["config", "storage", "auth", "accounts", "quota", "scheduler", "proxy"]

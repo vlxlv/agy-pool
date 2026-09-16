@@ -27,7 +27,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from agy_pool import config, storage, auth, accounts, quota, scheduler
+from agy_pool import config, storage, auth, accounts, quota, scheduler, proxy
 
 SCRIPT = os.path.join(ROOT, "bin", "agy-pool")
 loader = importlib.machinery.SourceFileLoader("agy_pool_bin", SCRIPT)
@@ -3441,6 +3441,90 @@ class AgyPoolTest(unittest.TestCase):
         self.assertIs(agy_pool.order_candidates, scheduler.order_candidates)
         self.assertIs(agy_pool.reserve_round_robin_candidates, scheduler.reserve_round_robin_candidates)
         self.assertIs(agy_pool.reserve_round_robin_account, scheduler.reserve_round_robin_account)
+
+    def test_cp5a_modularization_proxy_extraction(self):
+        """Comprehensive verification for CP5A proxy modularization and semantics preservation."""
+        # 1. Symbol and class export identity (Section 16 Item W)
+        self.assertIs(agy_pool.SmartProxyHandler, proxy.SmartProxyHandler)
+        self.assertIs(agy_pool.ThreadedHTTPServer, proxy.ThreadedHTTPServer)
+        self.assertIs(agy_pool.HOP_BY_HOP_HEADERS, proxy.HOP_BY_HOP_HEADERS)
+        self.assertIs(agy_pool._hop_by_hop_names, proxy._hop_by_hop_names)
+        self.assertIs(agy_pool._is_timeout_error, proxy._is_timeout_error)
+        self.assertIs(agy_pool._record_success, proxy._record_success)
+        self.assertIs(agy_pool._record_quota_error, proxy._record_quota_error)
+        self.assertIs(agy_pool._record_validation_error, proxy._record_validation_error)
+        self.assertIs(agy_pool._record_auth_error, proxy._record_auth_error)
+
+        # 2. Ambiguous transport failure NO-REPLAY assertion (Section 17 & Section 16 Items G, H)
+        # Verify that a generation request failing with a generic transport exception or timeout
+        # is NOT automatically replayed onto a second account (upstream calls must be exactly 1).
+        self.save_accounts([account("acc_a"), account("acc_b")])
+        proxy_srv = self.start_server(proxy.SmartProxyHandler)
+
+        # Case A: Generic network drop / OSError -> 502, exactly 1 call
+        calls_generic = []
+        def fail_generic(*args, **kwargs):
+            calls_generic.append(1)
+            raise OSError("network dropped connection")
+
+        with mock.patch.object(agy_pool.urllib.request, "urlopen", fail_generic):
+            status, _, _ = self.request(proxy_srv, path="/v1internal:streamGenerateContent")
+            self.assertEqual(status, 502)
+        self.assertEqual(len(calls_generic), 1, "Generic transport failure MUST NOT replay ambiguous generation request")
+
+        # Case B: Upstream timeout -> 504, exactly 1 call
+        calls_timeout = []
+        def fail_timeout(*args, **kwargs):
+            calls_timeout.append(1)
+            raise socket.timeout("upstream read timed out")
+
+        with mock.patch.object(agy_pool.urllib.request, "urlopen", fail_timeout):
+            status, _, _ = self.request(proxy_srv, path="/v1internal:streamGenerateContent")
+            self.assertEqual(status, 504)
+        self.assertEqual(len(calls_timeout), 1, "Upstream timeout MUST NOT replay ambiguous generation request")
+
+        # 3. Normal buffered response and header preservation (Section 16 Items A, S, T)
+        scenario = Scenario({
+            "*": [(200, b'{"result":"ok"}', {
+                "Content-Encoding": "gzip",
+                "X-Custom-Header": "value",
+                "Connection": "keep-alive",
+            })]
+        })
+        p = self.start_proxy(scenario)
+        status, body, headers = self.request(p, path="/v1internal:generateContent", headers={"X-Client-Header": "client-val"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'{"result":"ok"}')
+        self.assertEqual(headers.get("Content-Encoding"), "gzip")
+        self.assertEqual(headers.get("X-Custom-Header"), "value")
+        self.assertNotIn("connection", headers)
+
+        # 4. Normal streaming response (Section 16 Item B)
+        scenario_stream = Scenario({"*": [(200, b"data: chunk1\n\n", {"Content-Type": "text/event-stream"})]})
+        p_stream = self.start_proxy(scenario_stream)
+        status_s, body_s, _ = self.request(p_stream, path="/v1internal:streamGenerateContent")
+        self.assertEqual(status_s, 200)
+        self.assertIn(b"data: chunk1", body_s)
+
+        # 5. State recording parity (Section 16 Items O, P)
+        self.save_accounts([account("acc_rec")], active="acc_rec")
+        scenario_rec = Scenario({"*": [(200, b'{"result":"gen"}', {})]})
+        p_rec = self.start_proxy(scenario_rec)
+        self.request(p_rec, path="/v1internal:generateContent")
+        pool_state = storage.load_pool()
+        acc_rec = pool_state["accounts"][0]
+        self.assertEqual(acc_rec.get("gen_count"), 1)
+        self.assertEqual(acc_rec.get("request_count"), 1)
+        self.assertIsNotNone(acc_rec.get("last_used_at"))
+
+        # Metadata request increments request_count only, NOT gen_count
+        scenario_meta = Scenario({"*": [(200, b'{"models":[]}', {})]})
+        p_meta = self.start_proxy(scenario_meta)
+        self.request(p_meta, path="/v1/models")
+        pool_state2 = storage.load_pool()
+        acc_rec2 = pool_state2["accounts"][0]
+        self.assertEqual(acc_rec2.get("gen_count"), 1)
+        self.assertEqual(acc_rec2.get("request_count"), 2)
 
 
 if __name__ == "__main__":
