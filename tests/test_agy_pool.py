@@ -27,7 +27,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from agy_pool import config, storage
+from agy_pool import config, storage, auth, accounts
 
 SCRIPT = os.path.join(ROOT, "bin", "agy-pool")
 loader = importlib.machinery.SourceFileLoader("agy_pool_bin", SCRIPT)
@@ -2769,6 +2769,248 @@ class AgyPoolTest(unittest.TestCase):
         config.configure_paths(temp_outer)
         self.assertEqual(config.GEMINI_DIR, temp_outer)
         config.configure_paths(os.path.join(self.temp.name, ".gemini"))
+
+    def test_cp2_modularization_auth_and_accounts_extraction(self):
+        """Verify CP2 modularization: auth.py, accounts.py extraction, re-export parity, and behavior preservation."""
+        # A. _decode_cred
+        decoded_id = auth._decode_cred("6b6a6d6b6a6a6c6a6c6a6f636b772e3732292933346832686b3639283f68696f2c2e35363530326e3d6e6a693f2a743b2a2a29743d35353d363f2f293f283935342e3f342e74393537")
+        self.assertTrue(decoded_id.endswith(".apps.googleusercontent.com"))
+        self.assertEqual(decoded_id, auth._DEFAULT_CLIENT_ID)
+        self.assertEqual(agy_pool._decode_cred, auth._decode_cred)
+
+        # B. CLIENT_ID, CLIENT_SECRET, OAUTH_SCOPES
+        self.assertEqual(agy_pool.CLIENT_ID, auth.CLIENT_ID)
+        self.assertEqual(agy_pool.CLIENT_SECRET, auth.CLIENT_SECRET)
+        self.assertEqual(agy_pool.OAUTH_SCOPES, auth.OAUTH_SCOPES)
+        self.assertIn("https://www.googleapis.com/auth/cloud-platform", auth.OAUTH_SCOPES)
+
+        # C. TOKEN_FIELDS, STATUS_FIELDS, REFRESH_PERSIST_FIELDS
+        self.assertEqual(auth.TOKEN_FIELDS, ("access_token", "refresh_token", "token_expiry", "updated_at", "id_token"))
+        self.assertEqual(auth.STATUS_FIELDS, ("status", "validation_url", "rate_limited_until"))
+        self.assertEqual(auth.REFRESH_PERSIST_FIELDS, auth.TOKEN_FIELDS + auth.STATUS_FIELDS + ("last_quota",))
+        self.assertEqual(agy_pool.TOKEN_FIELDS, auth.TOKEN_FIELDS)
+        self.assertEqual(agy_pool.STATUS_FIELDS, auth.STATUS_FIELDS)
+        self.assertEqual(agy_pool.REFRESH_PERSIST_FIELDS, auth.REFRESH_PERSIST_FIELDS)
+
+        # D. decode_jwt_payload
+        header = base64.urlsafe_b64encode(b'{"alg":"none"}').decode().rstrip("=")
+        payload = base64.urlsafe_b64encode(b'{"email":"alice@example.com","sub":"12345"}').decode().rstrip("=")
+        jwt_token = f"{header}.{payload}."
+        decoded = auth.decode_jwt_payload(jwt_token)
+        self.assertEqual(decoded.get("email"), "alice@example.com")
+        self.assertEqual(decoded.get("sub"), "12345")
+        self.assertEqual(auth.decode_jwt_payload("invalid.token"), {})
+        self.assertEqual(auth.decode_jwt_payload(""), {})
+        self.assertEqual(agy_pool.decode_jwt_payload(jwt_token), decoded)
+
+        # E. _is_validation_error, _extract_validation_url, _is_auth_error
+        valid_err_body = json.dumps({
+            "error": {
+                "message": "validation_required",
+                "details": [{"metadata": {"validation_url": "https://accounts.google.com/verify?id=123"}}]
+            }
+        }).encode("utf-8")
+        self.assertTrue(auth._is_validation_error(403, valid_err_body))
+        self.assertFalse(auth._is_validation_error(200, valid_err_body))
+        self.assertEqual(auth._extract_validation_url(valid_err_body), "https://accounts.google.com/verify?id=123")
+        self.assertTrue(auth._is_auth_error(401, b"Unauthorized"))
+        self.assertTrue(auth._is_auth_error(403, b"unauthenticated"))
+        self.assertFalse(auth._is_auth_error(200, b"ok"))
+        self.assertEqual(agy_pool._is_validation_error(403, valid_err_body), True)
+        self.assertEqual(agy_pool._extract_validation_url(valid_err_body), "https://accounts.google.com/verify?id=123")
+        self.assertEqual(agy_pool._is_auth_error(401, b"Unauthorized"), True)
+
+        # F. _persist_account_fields
+        test_pool = {
+            "version": 1,
+            "strategy": "max_quota",
+            "active_account_id": "acc_1",
+            "accounts": [{
+                "id": "acc_1",
+                "email": "persist@example.test",
+                "access_token": "old_token",
+                "status": "validation_required",
+                "validation_url": "https://verify.example.com",
+            }]
+        }
+        storage.save_pool(test_pool)
+        acc_obj = {"id": "acc_1", "access_token": "new_token"}
+        auth._persist_account_fields(acc_obj, ["access_token", "status"])
+        persisted = storage._find_account(storage.load_pool(), {"id": "acc_1"})
+        self.assertEqual(persisted["access_token"], "new_token")
+        self.assertNotIn("status", persisted)
+
+        # G. refresh_token
+        acc_valid = {
+            "id": "acc_1",
+            "access_token": "still_valid",
+            "token_expiry": time.time() + 3600,
+            "refresh_token": "rf_1",
+        }
+        self.assertEqual(auth.refresh_token(acc_valid), "still_valid")
+
+        acc_expiring = {
+            "id": "acc_1",
+            "access_token": "old_expiring",
+            "token_expiry": time.time() + 10,
+            "refresh_token": "rf_1",
+        }
+        mock_resp_data = json.dumps({"access_token": "refreshed_tok", "expires_in": 1800}).encode()
+        mock_resp = mock.MagicMock()
+        mock_resp.read.return_value = mock_resp_data
+        mock_resp.__enter__.return_value = mock_resp
+        mock_resp.__exit__.return_value = False
+        with mock.patch("urllib.request.urlopen", return_value=mock_resp):
+            refreshed = auth.refresh_token(acc_expiring)
+            self.assertEqual(refreshed, "refreshed_tok")
+            self.assertEqual(acc_expiring["access_token"], "refreshed_tok")
+
+        # H. display_account_name privacy semantics
+        self.assertEqual(accounts.display_account_name({"name": "Work Account", "email": "work@example.com"}), "Work Account")
+        self.assertEqual(accounts.display_account_name({"id": "acc_1", "email": "user@gmail.com"}), "Account 1")
+        self.assertEqual(accounts.display_account_name({"id": "acc_42", "email": "user@gmail.com"}), "Account 42")
+        self.assertEqual(accounts.display_account_name({"id": "other", "email": "secret@example.com"}), "Account")
+        self.assertEqual(accounts.display_account_name(None), "Account")
+        self.assertEqual(agy_pool.display_account_name({"id": "acc_2"}), "Account 2")
+
+        # I. find_account_by_target
+        acc_list = [
+            {"id": "acc_1", "name": "Primary", "email": "p@example.com"},
+            {"id": "acc_2", "name": "Secondary", "email": "s@example.com"},
+        ]
+        self.assertEqual(accounts.find_account_by_target(acc_list, "1")["id"], "acc_1")
+        self.assertEqual(accounts.find_account_by_target(acc_list, "2")["id"], "acc_2")
+        self.assertEqual(accounts.find_account_by_target(acc_list, "acc_1")["id"], "acc_1")
+        self.assertEqual(accounts.find_account_by_target(acc_list, "s@example.com")["id"], "acc_2")
+        self.assertEqual(accounts.find_account_by_target(acc_list, "Primary")["id"], "acc_1")
+        self.assertIsNone(accounts.find_account_by_target(acc_list, "99"))
+        self.assertIsNone(accounts.find_account_by_target(acc_list, "nonexistent"))
+
+        # J. find_free_port
+        free_port = accounts.find_free_port(start_port=18080)
+        self.assertIsInstance(free_port, int)
+        self.assertGreaterEqual(free_port, 18080)
+
+        # K. ThreadedHTTPServer & OAuthCallbackHandler
+        handler_class = accounts.OAuthCallbackHandler
+        self.assertIs(agy_pool.OAuthCallbackHandler, handler_class)
+        self.assertIs(agy_pool.ThreadedHTTPServer, accounts.ThreadedHTTPServer)
+
+        # L. write_agy_token_file & sync_active_agy_token_file
+        test_acc = {
+            "id": "acc_1",
+            "access_token": "token_for_token_file",
+            "refresh_token": "rf_token_file",
+            "token_expiry": time.time() + 3600,
+            "id_token": "id_tok_val",
+        }
+        accounts.write_agy_token_file(test_acc)
+        self.assertTrue(os.path.exists(config.AGY_TOKEN_FILE))
+        self.assertEqual(oct(os.stat(config.AGY_TOKEN_FILE).st_mode & 0o777), "0o600")
+        with open(config.AGY_TOKEN_FILE, "r", encoding="utf-8") as f:
+            token_json = json.load(f)
+        self.assertEqual(token_json["token"]["access_token"], "token_for_token_file")
+        self.assertEqual(token_json["auth_method"], "consumer")
+
+        storage.save_pool({
+            "version": 1,
+            "strategy": "max_quota",
+            "active_account_id": "acc_1",
+            "accounts": [test_acc],
+        })
+        sync_result = accounts.sync_active_agy_token_file()
+        self.assertTrue(sync_result)
+
+        # M. rename_account
+        renamed = accounts.rename_account("acc_1", "Renamed Alpha")
+        self.assertTrue(renamed)
+        self.assertEqual(storage.load_pool()["accounts"][0]["name"], "Renamed Alpha")
+
+        # N. switch_account & remove_account
+        acc_two = {
+            "id": "acc_2",
+            "name": "Beta",
+            "email": "beta@example.test",
+            "access_token": "token_2",
+            "refresh_token": "rf_2",
+            "token_expiry": time.time() + 3600,
+            "last_quota": {"remaining_fraction": 0.8},
+        }
+        storage.pool_transaction(lambda p: p["accounts"].append(acc_two))
+        switched = accounts.switch_account("acc_2", silent=True)
+        self.assertTrue(switched)
+        self.assertEqual(storage.load_pool()["active_account_id"], "acc_2")
+
+        removed = accounts.remove_account("acc_1")
+        self.assertTrue(removed)
+        remaining = storage.load_pool()["accounts"]
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["id"], "acc_2")
+
+        # O. encrypt_bundle & decrypt_bundle
+        plain_bytes = b'{"secret": "sensitive-oauth-data-cp2"}'
+        enc_bundle = accounts.encrypt_bundle(plain_bytes, "passphrase123")
+        self.assertEqual(enc_bundle.get("format"), "agy-pool-encrypted-v1")
+        decrypted_bytes = accounts.decrypt_bundle(enc_bundle, "passphrase123")
+        self.assertEqual(decrypted_bytes, plain_bytes)
+
+        with self.assertRaises(ValueError):
+            accounts.decrypt_bundle(enc_bundle, "wrong_password")
+
+        tampered = dict(enc_bundle)
+        tampered["ciphertext"] = base64.b64encode(b"corrupt").decode("ascii")
+        with self.assertRaises(ValueError):
+            accounts.decrypt_bundle(tampered, "passphrase123")
+
+        # P. export_pool & import_pool
+        export_path = os.path.join(self.temp.name, ".gemini", "cp2_export.json")
+        exp_res = accounts.export_pool(export_path)
+        self.assertTrue(exp_res)
+        self.assertTrue(os.path.exists(export_path))
+        self.assertEqual(oct(os.stat(export_path).st_mode & 0o777), "0o600")
+
+        enc_export_path = os.path.join(self.temp.name, ".gemini", "cp2_export.enc")
+        exp_enc_res = accounts.export_pool(enc_export_path, encrypt=True, password="export_pass")
+        self.assertTrue(exp_enc_res)
+        self.assertTrue(os.path.exists(enc_export_path))
+
+        imp_res = accounts.import_pool(enc_export_path, password="export_pass", replace=True)
+        self.assertTrue(imp_res)
+        self.assertEqual(len(storage.load_pool()["accounts"]), 1)
+
+        # Q. Quota prober hook
+        probe_called = []
+        def mock_probe(acc):
+            probe_called.append(acc.get("id"))
+            return {"remaining_fraction": 1.0}
+        formatter_called = []
+        def mock_formatter(q):
+            formatter_called.append(q)
+
+        accounts.set_quota_prober(mock_probe, mock_formatter)
+        self.assertIs(accounts._quota_prober, mock_probe)
+        self.assertIs(accounts._quota_formatter, mock_formatter)
+        # Restore real quota prober
+        agy_pool.accounts.set_quota_prober(lambda *args, **kwargs: agy_pool.query_quota(*args, **kwargs), agy_pool._format_account_quota_summary)
+
+        # R. Re-export parity between bin/agy-pool and agy_pool submodules
+        for sym in (
+            "_decode_cred", "_DEFAULT_CLIENT_ID", "_DEFAULT_CLIENT_SECRET",
+            "CLIENT_ID", "CLIENT_SECRET", "OAUTH_SCOPES", "TOKEN_FIELDS",
+            "STATUS_FIELDS", "REFRESH_PERSIST_FIELDS", "_persist_account_fields",
+            "decode_jwt_payload", "refresh_token", "_is_validation_error",
+            "_extract_validation_url", "_is_auth_error",
+        ):
+            self.assertEqual(getattr(agy_pool, sym), getattr(auth, sym), f"Auth symbol parity failed: {sym}")
+
+        for sym in (
+            "display_account_name", "find_account_by_target", "ThreadedHTTPServer",
+            "OAuthCallbackHandler", "find_free_port", "do_login", "import_current",
+            "write_agy_token_file", "sync_active_agy_token_file", "remove_account",
+            "switch_account", "rename_account", "do_verify", "encrypt_bundle",
+            "decrypt_bundle", "export_pool", "import_pool",
+        ):
+            self.assertEqual(getattr(agy_pool, sym), getattr(accounts, sym), f"Accounts symbol parity failed: {sym}")
 
 
 if __name__ == "__main__":
