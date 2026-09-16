@@ -145,16 +145,92 @@ POOL_LOCK = threading.RLock()
 FILE_LOCKS = {}
 FILE_LOCKS_LOCK = threading.Lock()
 
-GEMINI_DIR = os.path.expanduser("~/.gemini")
-POOL_CONFIG_FILE = os.path.join(GEMINI_DIR, "agy-pool-accounts.json")
-PID_FILE = os.path.join(GEMINI_DIR, "agy-pool.pid")
-LOG_FILE = os.path.join(GEMINI_DIR, "agy-pool.log")
+# ----------------- Path Configuration & Test Isolation Guard -----------------
+_REAL_PRODUCTION_GEMINI_DIR = (
+    os.environ.get("AGY_REAL_GEMINI_DIR")
+    or os.path.abspath(os.path.expanduser("~/.gemini"))
+)
+_FORBIDDEN_WRITE_DIRS = {
+    os.path.realpath(_REAL_PRODUCTION_GEMINI_DIR),
+    os.path.abspath(os.path.expanduser(_REAL_PRODUCTION_GEMINI_DIR)),
+}
+_TEST_MODE = bool(os.environ.get("AGY_TEST_MODE") == "1")
+
+
+def is_test_mode():
+    """Return True if running under isolated test mode."""
+    return bool(_TEST_MODE or os.environ.get("AGY_TEST_MODE") == "1")
+
+
+def set_test_mode(enabled=True):
+    """Enable or disable fail-closed test mode."""
+    global _TEST_MODE
+    _TEST_MODE = bool(enabled)
+    if enabled:
+        os.environ["AGY_TEST_MODE"] = "1"
+    else:
+        os.environ.pop("AGY_TEST_MODE", None)
+
+
+def register_forbidden_path(path):
+    """Register an additional path that must never be written to in test mode."""
+    if path:
+        p = os.path.abspath(os.path.expanduser(str(path)))
+        _FORBIDDEN_WRITE_DIRS.add(os.path.realpath(p))
+        _FORBIDDEN_WRITE_DIRS.add(p)
+
+
+def _assert_safe_write_path(path):
+    """
+    Fail-closed test guard: prevent tests from ever writing to production or protected paths.
+    Raises RuntimeError immediately if in test mode and path targets a forbidden directory.
+    """
+    if not is_test_mode() or not path:
+        return
+    try:
+        real_path = os.path.realpath(os.path.abspath(os.path.expanduser(str(path))))
+    except Exception:
+        return
+    for forbidden in _FORBIDDEN_WRITE_DIRS:
+        if real_path == forbidden or real_path.startswith(forbidden + os.sep):
+            raise RuntimeError(
+                f"[FAIL-CLOSED TEST GUARD] Refusing to write to protected path during test mode: {real_path}"
+            )
+
+
+def configure_paths(gemini_dir=None):
+    """
+    Configure runtime storage paths.
+    If gemini_dir is provided, paths are rooted at gemini_dir.
+    Otherwise, uses AGY_GEMINI_DIR environment variable or defaults to ~/.gemini.
+    Returns configured GEMINI_DIR.
+    """
+    global GEMINI_DIR, POOL_CONFIG_FILE, PID_FILE, LOG_FILE, AGY_CLI_DIR, AGY_TOKEN_FILE
+    if gemini_dir is not None:
+        base = os.path.abspath(os.path.expanduser(gemini_dir))
+    elif os.environ.get("AGY_GEMINI_DIR"):
+        base = os.path.abspath(os.path.expanduser(os.environ["AGY_GEMINI_DIR"]))
+    else:
+        base = os.path.abspath(os.path.expanduser("~/.gemini"))
+
+    if is_test_mode() and gemini_dir is not None:
+        _assert_safe_write_path(base)
+
+    GEMINI_DIR = base
+    POOL_CONFIG_FILE = os.path.join(GEMINI_DIR, "agy-pool-accounts.json")
+    PID_FILE = os.path.join(GEMINI_DIR, "agy-pool.pid")
+    LOG_FILE = os.path.join(GEMINI_DIR, "agy-pool.log")
+    AGY_CLI_DIR = os.path.join(GEMINI_DIR, "antigravity-cli")
+    AGY_TOKEN_FILE = os.path.join(AGY_CLI_DIR, "antigravity-oauth-token")
+    return GEMINI_DIR
+
+
+# Initialize default paths from environment or default location
+configure_paths()
 DEFAULT_MAX_LOG_BYTES = 5 * 1024 * 1024  # 5 MB
 DEFAULT_BACKUP_LOG_COUNT = 1
 MAX_LOG_BYTES = int(os.environ.get("AGY_LOG_MAX_BYTES", DEFAULT_MAX_LOG_BYTES))
 BACKUP_LOG_COUNT = int(os.environ.get("AGY_LOG_BACKUP_COUNT", DEFAULT_BACKUP_LOG_COUNT))
-AGY_CLI_DIR = os.path.join(GEMINI_DIR, "antigravity-cli")
-AGY_TOKEN_FILE = os.path.join(AGY_CLI_DIR, "antigravity-oauth-token")
 
 # ANSI Color Codes
 CLR_RESET = "\033[0m"
@@ -169,6 +245,8 @@ CLR_RED = "\033[31m"
 
 
 def ensure_dirs():
+    _assert_safe_write_path(GEMINI_DIR)
+    _assert_safe_write_path(AGY_CLI_DIR)
     os.makedirs(GEMINI_DIR, mode=0o700, exist_ok=True)
     os.makedirs(AGY_CLI_DIR, mode=0o700, exist_ok=True)
 
@@ -191,6 +269,7 @@ def _thread_file_lock(path):
 @contextlib.contextmanager
 def _file_lock(path, exclusive=True, blocking=True):
     """Lock a stable sidecar inode across both threads and POSIX processes."""
+    _assert_safe_write_path(path)
     thread_lock = _thread_file_lock(path)
     if not thread_lock.acquire(blocking=blocking):
         raise BlockingIOError("lock is already held")
@@ -224,6 +303,7 @@ def _read_pool_unlocked():
 
 
 def _atomic_json_write(path, data):
+    _assert_safe_write_path(path)
     directory = os.path.dirname(path)
     os.makedirs(directory, mode=0o700, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
@@ -1567,6 +1647,7 @@ def export_pool(file_path=None, encrypt=False, password=None, no_stats=False):
         file_path = f"agy-pool-backup-{date_str}{ext}"
 
     directory = os.path.dirname(os.path.abspath(file_path))
+    _assert_safe_write_path(file_path)
     os.makedirs(directory, mode=0o700, exist_ok=True)
     fd = os.open(file_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -1738,12 +1819,19 @@ def _format_size(bytes_val):
         return f"{bytes_val / (1024 * 1024):.1f} MB"
 
 
-def rotate_log_if_needed(log_path=LOG_FILE, max_bytes=MAX_LOG_BYTES, backup_count=BACKUP_LOG_COUNT, force=False):
+def rotate_log_if_needed(log_path=None, max_bytes=None, backup_count=None, force=False):
     """
     Performs copytruncate log rotation if the file exceeds max_bytes (or force=True).
     Retains open file descriptors without disruption to running background daemons.
     Returns True if rotated, False otherwise.
     """
+    if log_path is None:
+        log_path = LOG_FILE
+    if max_bytes is None:
+        max_bytes = MAX_LOG_BYTES
+    if backup_count is None:
+        backup_count = BACKUP_LOG_COUNT
+    _assert_safe_write_path(log_path)
     if not os.path.exists(log_path):
         return False
     if not force:
@@ -1803,8 +1891,13 @@ def rotate_log_if_needed(log_path=LOG_FILE, max_bytes=MAX_LOG_BYTES, backup_coun
         return False
 
 
-def clear_log(log_path=LOG_FILE, backup_count=BACKUP_LOG_COUNT):
+def clear_log(log_path=None, backup_count=None):
     """Safely clears/truncates active log file and removes backup logs."""
+    if log_path is None:
+        log_path = LOG_FILE
+    if backup_count is None:
+        backup_count = BACKUP_LOG_COUNT
+    _assert_safe_write_path(log_path)
     lock_file = log_path + ".lock"
     with _file_lock(lock_file):
         if os.path.exists(log_path):
@@ -2601,6 +2694,8 @@ def start_proxy_daemon(foreground=False):
                 return
 
         # Launch background process
+        _assert_safe_write_path(LOG_FILE)
+        _assert_safe_write_path(PID_FILE)
         cmd = [sys.executable, os.path.abspath(__file__), "daemon-run"]
         ensure_dirs()
         log_fd = os.open(LOG_FILE, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
@@ -2881,7 +2976,7 @@ def run_doctor():
             print(f"  {CLR_RED}✖{CLR_RESET} Account Pool: Failed to read pool file: {e}")
             issues_found += 1
     else:
-        print(f"  {CLR_YELLOW}○{CLR_RESET} Account Pool: No account pool file found yet (~/.gemini/agy-pool-accounts.json)")
+        print(f"  {CLR_YELLOW}○{CLR_RESET} Account Pool: No account pool file found yet ({POOL_CONFIG_FILE})")
         print(f"    {CLR_DIM}↳ Run 'agy-pool import-current' or 'agy-pool login' to initialize.{CLR_RESET}")
         warnings_found += 1
 
@@ -2896,7 +2991,7 @@ def run_doctor():
         warnings_found += 1
 
     # 6. Session Database
-    db_path = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
+    db_path = os.path.join(AGY_CLI_DIR, "conversation_summaries.db")
     if os.path.exists(db_path):
         try:
             db_uri = "file:" + urllib.parse.quote(db_path, safe="/") + "?mode=ro"
@@ -2939,7 +3034,7 @@ def find_latest_conversation_for_dir(start_dir=None):
         start_dir = os.getcwd()
     start_dir = os.path.realpath(start_dir)
     home_dir = os.path.realpath(os.path.expanduser("~"))
-    db_path = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
+    db_path = os.path.join(AGY_CLI_DIR, "conversation_summaries.db")
     if not os.path.exists(db_path):
         return None, None, None
 
@@ -3006,7 +3101,7 @@ def resolve_continue_arg(extra_args):
 
     cid, title, matched_dir = find_latest_conversation_for_dir(os.getcwd())
     if cid:
-        lock_file = os.path.expanduser(f"~/.gemini/antigravity-cli/presence/{cid}.lock")
+        lock_file = os.path.join(AGY_CLI_DIR, "presence", f"{cid}.lock")
         is_locked = False
         if os.path.exists(lock_file) and HAS_FCNTL:
             try:

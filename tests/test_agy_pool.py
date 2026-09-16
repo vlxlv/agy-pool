@@ -96,16 +96,29 @@ class AgyPoolTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.home_patch = mock.patch.dict(os.environ, {"HOME": self.temp.name})
-        self.home_patch.start()
-        self.addCleanup(self.home_patch.stop)
         gemini = os.path.join(self.temp.name, ".gemini")
-        agy_pool.GEMINI_DIR = gemini
-        agy_pool.POOL_CONFIG_FILE = os.path.join(gemini, "agy-pool-accounts.json")
-        agy_pool.PID_FILE = os.path.join(gemini, "agy-pool.pid")
-        agy_pool.LOG_FILE = os.path.join(gemini, "agy-pool.log")
-        agy_pool.AGY_CLI_DIR = os.path.join(gemini, "antigravity-cli")
-        agy_pool.AGY_TOKEN_FILE = os.path.join(agy_pool.AGY_CLI_DIR, "antigravity-oauth-token")
+
+        # Capture prior state before configuring isolated environment
+        orig_gemini_dir = agy_pool.GEMINI_DIR
+        orig_test_mode = agy_pool.is_test_mode()
+
+        self.env_patch = mock.patch.dict(os.environ, {
+            "HOME": self.temp.name,
+            "AGY_GEMINI_DIR": gemini,
+            "AGY_TEST_MODE": "1",
+        })
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+
+        # Explicitly configure isolated storage paths and enable fail-closed test guard
+        agy_pool.configure_paths(gemini)
+        agy_pool.set_test_mode(True)
+
+        def _restore_state():
+            agy_pool.set_test_mode(orig_test_mode)
+            agy_pool.configure_paths(orig_gemini_dir)
+        self.addCleanup(_restore_state)
+
         agy_pool.FILE_LOCKS.clear()
         agy_pool._QUOTA_REFRESH_IN_FLIGHT.clear()
         agy_pool._QUOTA_REFRESH_RETRY.clear()
@@ -2417,6 +2430,74 @@ class AgyPoolTest(unittest.TestCase):
         self.assertEqual(acc2["name"], "Standby Beta")
         self.assertEqual(acc2["rate_limited_until"], cooldown_target)
         self.assertEqual(acc2["last_quota"]["gemini_5h"]["fraction"], 0.40)
+
+    def test_production_pool_path_isolation_and_fail_closed_guard(self):
+        """
+        Regression test: Verify that all pool state operations are strictly
+        redirected to isolated test paths, a sentinel file in a protected location
+        remains completely untouched, and direct writes to forbidden paths raise
+        RuntimeError in test mode.
+        """
+        with tempfile.TemporaryDirectory() as protected_dir:
+            sentinel_path = os.path.join(protected_dir, "agy-pool-accounts.json")
+            sentinel_payload = {"version": 1, "accounts": [{"id": "protected_account", "email": "protected@example.com"}]}
+            with open(sentinel_path, "w", encoding="utf-8") as f:
+                json.dump(sentinel_payload, f)
+            initial_mtime = os.path.getmtime(sentinel_path)
+
+            agy_pool.register_forbidden_path(protected_dir)
+
+            # 1. Perform writes using the standard test harness
+            self.save_accounts([account("isolated_1"), account("isolated_2")], active="isolated_1")
+            agy_pool.pool_transaction(lambda p: p["accounts"].append(account("isolated_3")))
+
+            # Verify isolated pool got updated inside self.temp.name
+            pool = agy_pool.load_pool()
+            self.assertEqual(len(pool["accounts"]), 3)
+            self.assertEqual([a["id"] for a in pool["accounts"]], ["isolated_1", "isolated_2", "isolated_3"])
+            self.assertTrue(agy_pool.POOL_CONFIG_FILE.startswith(self.temp.name))
+
+            # Verify sentinel is 100% untouched
+            with open(sentinel_path, "r", encoding="utf-8") as f:
+                sentinel_after = json.load(f)
+            self.assertEqual(sentinel_after, sentinel_payload)
+            self.assertEqual(os.path.getmtime(sentinel_path), initial_mtime)
+
+            # 2. Verify fail-closed guard prevents writing to protected paths
+            with self.assertRaises(RuntimeError) as cm_write:
+                agy_pool._atomic_json_write(sentinel_path, {"hacked": True})
+            self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_write.exception))
+
+            # Verify fail-closed guard prevents acquiring lock in protected path
+            with self.assertRaises(RuntimeError) as cm_lock:
+                with agy_pool._file_lock(os.path.join(protected_dir, "test.lock")):
+                    pass
+            self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_lock.exception))
+
+            # Verify fail-closed guard prevents log rotation / clear on protected path
+            with self.assertRaises(RuntimeError) as cm_log:
+                agy_pool.rotate_log_if_needed(os.path.join(protected_dir, "test.log"), force=True)
+            self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_log.exception))
+
+            with self.assertRaises(RuntimeError) as cm_clear:
+                agy_pool.clear_log(os.path.join(protected_dir, "test.log"))
+            self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_clear.exception))
+
+            # Verify fail-closed guard prevents configuring paths to protected path
+            with self.assertRaises(RuntimeError) as cm_cfg:
+                agy_pool.configure_paths(protected_dir)
+            self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_cfg.exception))
+
+            # Verify fail-closed guard strictly protects production GEMINI_DIR
+            with self.assertRaises(RuntimeError) as cm_prod:
+                agy_pool._assert_safe_write_path(
+                    os.path.join(agy_pool._REAL_PRODUCTION_GEMINI_DIR, "agy-pool-accounts.json")
+                )
+            self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_prod.exception))
+
+            # Verify sentinel was still never modified
+            with open(sentinel_path, "r", encoding="utf-8") as f:
+                self.assertEqual(json.load(f), sentinel_payload)
 
 
 if __name__ == "__main__":
