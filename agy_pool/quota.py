@@ -343,10 +343,9 @@ def format_remaining_time(iso_reset_time):
 
 def render_progress_bar(fraction, width=10):
     if fraction is None:
-        return f"{config.CLR_DIM}[{'░' * width}]   N/A{config.CLR_RESET}"
+        return f"[{config.CLR_DIM}{'─' * width}{config.CLR_RESET}]   N/A"
     fraction = max(0.0, min(1.0, float(fraction)))
     filled = int(round(fraction * width))
-    bar = "█" * filled + "░" * (width - filled)
     pct = f"{fraction * 100:5.1f}%"
     if fraction > 0.4:
         color = config.CLR_GREEN
@@ -354,7 +353,13 @@ def render_progress_bar(fraction, width=10):
         color = config.CLR_YELLOW
     else:
         color = config.CLR_RED
-    return f"{color}[{bar}] {pct}{config.CLR_RESET}"
+    filled_bar = "━" * filled
+    empty_bar = "─" * (width - filled)
+    return (
+        f"[{color}{filled_bar}{config.CLR_RESET}"
+        f"{config.CLR_DIM}{empty_bar}{config.CLR_RESET}] "
+        f"{color}{pct}{config.CLR_RESET}"
+    )
 
 
 def _display_quota_fractions(quota):

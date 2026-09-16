@@ -9,6 +9,7 @@ import io
 import json
 import multiprocessing
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -385,6 +386,65 @@ class AgyPoolTest(unittest.TestCase):
     def test_unknown_quota_cli_display_is_not_full(self):
         self.assertIn("N/A", agy_pool.render_progress_bar(None))
         self.assertNotIn("100.0%", agy_pool.render_progress_bar(None))
+        self.assertNotIn("█", agy_pool.render_progress_bar(None))
+        self.assertNotIn("░", agy_pool.render_progress_bar(None))
+
+    def test_render_progress_bar_aligned_and_colors(self):
+        def strip_ansi(text):
+            return re.sub(r"\x1b\[[0-9;]*[mK]", "", text)
+
+        # 1. Exact visual alignments with brackets
+        cases = [
+            (0.81, "[━━━━━━━━──]  81.0%"),
+            (0.30, "[━━━───────]  30.0%"),
+            (0.10, "[━─────────]  10.0%"),
+            (None, "[──────────]   N/A"),
+        ]
+        for frac, expected in cases:
+            raw = agy_pool.render_progress_bar(frac)
+            self.assertEqual(strip_ansi(raw), expected)
+
+        # 2. Width semantics: exactly 10 bar characters, no block characters
+        for frac in [0.81, 0.30, 0.10, 0.0, 1.0, None]:
+            raw = agy_pool.render_progress_bar(frac, width=10)
+            self.assertNotIn("█", raw)
+            self.assertNotIn("░", raw)
+            plain = strip_ansi(raw)
+            bar_content = plain[plain.index("[") + 1 : plain.index("]")]
+            self.assertEqual(len(bar_content), 10)
+            self.assertTrue(all(c in ("━", "─") for c in bar_content))
+
+        # 3. Existing color threshold semantics preserved
+        # > 0.4: green
+        raw_green = agy_pool.render_progress_bar(0.41)
+        self.assertIn(agy_pool.CLR_GREEN, raw_green)
+        self.assertNotIn(agy_pool.CLR_YELLOW, raw_green)
+        self.assertNotIn(agy_pool.CLR_RED, raw_green)
+
+        # > 0.15 and <= 0.4: yellow
+        raw_yellow = agy_pool.render_progress_bar(0.40)
+        self.assertIn(agy_pool.CLR_YELLOW, raw_yellow)
+        self.assertNotIn(agy_pool.CLR_GREEN, raw_yellow)
+        self.assertNotIn(agy_pool.CLR_RED, raw_yellow)
+
+        raw_yellow_edge = agy_pool.render_progress_bar(0.16)
+        self.assertIn(agy_pool.CLR_YELLOW, raw_yellow_edge)
+
+        # <= 0.15: red
+        raw_red = agy_pool.render_progress_bar(0.15)
+        self.assertIn(agy_pool.CLR_RED, red_raw := raw_red)
+        self.assertNotIn(agy_pool.CLR_GREEN, red_raw)
+        self.assertNotIn(agy_pool.CLR_YELLOW, red_raw)
+
+        # 4. Brackets remain uncolored; unused section uses CLR_DIM
+        raw_val = agy_pool.render_progress_bar(0.81)
+        self.assertTrue(raw_val.startswith(f"[{agy_pool.CLR_GREEN}"))
+        self.assertIn(f"{agy_pool.CLR_DIM}──{agy_pool.CLR_RESET}]", raw_val)
+        self.assertTrue(raw_val.endswith(f"{agy_pool.CLR_GREEN} 81.0%{agy_pool.CLR_RESET}"))
+
+        # Unknown quota uses CLR_DIM inside brackets
+        raw_none = agy_pool.render_progress_bar(None)
+        self.assertEqual(raw_none, f"[{agy_pool.CLR_DIM}{'─' * 10}{agy_pool.CLR_RESET}]   N/A")
 
     def test_threaded_request_count_transaction_has_no_lost_updates(self):
         self.save_accounts([account("a")])
