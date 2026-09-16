@@ -189,8 +189,10 @@ def _assert_safe_write_path(path):
         return
     try:
         real_path = os.path.realpath(os.path.abspath(os.path.expanduser(str(path))))
-    except Exception:
-        return
+    except Exception as e:
+        raise RuntimeError(
+            f"[FAIL-CLOSED TEST GUARD] Failed to resolve path safely: {path}"
+        ) from e
     for forbidden in _FORBIDDEN_WRITE_DIRS:
         if real_path == forbidden or real_path.startswith(forbidden + os.sep):
             raise RuntimeError(
@@ -2755,6 +2757,7 @@ def start_proxy_daemon(foreground=False):
                     elif raw:
                         file_pid = int(raw)
                     if file_pid == os.getpid():
+                        _assert_safe_write_path(PID_FILE)
                         os.unlink(PID_FILE)
                 except (OSError, ValueError, json.JSONDecodeError):
                     pass
@@ -2783,6 +2786,7 @@ def stop_proxy_daemon():
         print(f"{CLR_RED}[Error] Failed to stop daemon: {e}{CLR_RESET}")
     finally:
         if get_daemon_pid() is None and os.path.exists(PID_FILE):
+            _assert_safe_write_path(PID_FILE)
             try:
                 os.remove(PID_FILE)
             except OSError:

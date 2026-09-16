@@ -2499,6 +2499,62 @@ class AgyPoolTest(unittest.TestCase):
             with open(sentinel_path, "r", encoding="utf-8") as f:
                 self.assertEqual(json.load(f), sentinel_payload)
 
+    def test_pid_deletion_fail_closed_guard_and_path_resolution_errors(self):
+        """
+        Regression test: Verify that PID deletion operations (unlink, remove) are
+        blocked in test mode when targeting protected directories, path normalization
+        failures fail closed, temporary writes succeed, and production mode is unaffected.
+        """
+        with tempfile.TemporaryDirectory() as protected_dir:
+            agy_pool.register_forbidden_path(protected_dir)
+            protected_pid = os.path.join(protected_dir, "agy-pool.pid")
+            with open(protected_pid, "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid()}, f)
+
+            # A. PID unlink is blocked in test mode when PID_FILE resolves inside a protected directory.
+            with mock.patch.object(agy_pool, "PID_FILE", protected_pid):
+                with self.assertRaises(RuntimeError) as cm_unlink:
+                    with open(agy_pool.PID_FILE, "r", encoding="utf-8") as f:
+                        raw = f.read().strip()
+                    file_pid = int(json.loads(raw).get("pid", 0))
+                    if file_pid == os.getpid():
+                        agy_pool._assert_safe_write_path(agy_pool.PID_FILE)
+                        os.unlink(agy_pool.PID_FILE)
+                self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_unlink.exception))
+                self.assertTrue(os.path.exists(protected_pid))
+
+            # B. PID remove is blocked in test mode when PID_FILE resolves inside a protected directory.
+            with mock.patch.object(agy_pool, "PID_FILE", protected_pid), \
+                 mock.patch.object(agy_pool, "get_daemon_pid", side_effect=[99999, None]):
+                with self.assertRaises(RuntimeError) as cm_remove:
+                    agy_pool.stop_proxy_daemon()
+                self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_remove.exception))
+                self.assertTrue(os.path.exists(protected_pid))
+
+        # C. If path normalization/resolution raises an exception while test mode is active,
+        # _assert_safe_write_path() raises RuntimeError.
+        with mock.patch("os.path.realpath", side_effect=OSError("disk read failure")):
+            with self.assertRaises(RuntimeError) as cm_exc:
+                agy_pool._assert_safe_write_path("/some/temp/path.json")
+            self.assertIn("[FAIL-CLOSED TEST GUARD] Failed to resolve path safely", str(cm_exc.exception))
+
+        # D. Existing valid temporary-state writes still succeed.
+        temp_file = os.path.join(self.temp.name, "valid_temp.json")
+        agy_pool._atomic_json_write(temp_file, {"valid": True})
+        self.assertTrue(os.path.exists(temp_file))
+        with open(temp_file, "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"valid": True})
+        agy_pool._assert_safe_write_path(temp_file)
+
+        # E. Production-mode behavior remains unchanged when AGY_TEST_MODE is unset/false.
+        agy_pool.set_test_mode(False)
+        try:
+            agy_pool._assert_safe_write_path(agy_pool._REAL_PRODUCTION_GEMINI_DIR)
+            with mock.patch("os.path.realpath", side_effect=OSError("production-mode realpath error")):
+                agy_pool._assert_safe_write_path("/any/path")
+        finally:
+            agy_pool.set_test_mode(True)
+
 
 if __name__ == "__main__":
     unittest.main()
