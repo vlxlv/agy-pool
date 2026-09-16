@@ -879,6 +879,64 @@ Refreshing quota for 1 account(s)...
         self.assertFalse(conc["concurrent_detected"], "Failover must not be flagged as external concurrency")
         self.assertFalse(conc["is_inconclusive"])
 
+    def test_parse_accounts_cli_output_privacy_friendly_and_fallback(self):
+        sample = """
+Refreshing quota for 2 account(s)...
+
+====================================================================
+           Antigravity Multi-Account Pool v0.1.0-alpha.10
+====================================================================
+[1] Work Station  [* Active]  Hits: 15
+    • Gemini 5-Hour: [██████████] 100.0%  (Resets in 3h)
+    • Gemini Weekly: [████████░░]  80.0%  (Resets in 5d)
+[2] Account 2  [Ready]  Hits: 3
+    • Gemini 5-Hour: [██████░░░░]  60.0%  (Resets in 1h)
+    • Gemini Weekly: [██████████] 100.0%  (Resets in 6d)
+====================================================================
+"""
+        accounts = parse_accounts(sample)
+        self.assertEqual(len(accounts), 2)
+        # Account 1: explicit friendly name
+        self.assertEqual(accounts[0]["name"], "Work Station")
+        self.assertEqual(accounts[0]["display_name"], "Work Station")
+        self.assertEqual(accounts[0]["email"], "")
+        self.assertTrue(accounts[0]["active"])
+        self.assertEqual(accounts[0]["hits"], 15)
+
+        # Account 2: fallback
+        self.assertIsNone(accounts[1]["name"])
+        self.assertEqual(accounts[1]["display_name"], "Account 2")
+        self.assertEqual(accounts[1]["email"], "")
+        self.assertFalse(accounts[1]["active"])
+        self.assertEqual(accounts[1]["hits"], 3)
+
+    def test_log_delta_parsing_with_display_names(self):
+        with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as f:
+            log_path = f.name
+            f.write("[2026-09-16 10:00:00] [PROXY] POST streamGenerateContent -> Account 1 (Status: 200)\n")
+            f.write("[2026-09-16 10:01:00] [FAILOVER] Account Account 1 hit rate limit! Cooldown 60s\n")
+            f.write("[2026-09-16 10:01:05] [PROXY] POST streamGenerateContent -> Primary Work (Status: 200)\n")
+            f.flush()
+
+        try:
+            delta = parse_log_delta(log_path, 0)
+            self.assertEqual(delta["dispatches"], ["Account 1", "Primary Work"])
+            self.assertEqual(len(delta["failovers"]), 1)
+            self.assertEqual(delta["failovers"][0]["account"], "Account 1")
+            self.assertEqual(delta["failovers"][0]["reason"], "hit rate limit! Cooldown 60s")
+        finally:
+            os.unlink(log_path)
+
+    def test_verify_round_robin_with_display_names(self):
+        accounts = [
+            {"id": "acc_1", "name": "Work", "is_eligible": True},
+            {"id": "acc_2", "is_eligible": True},
+        ]
+        # Dispatches using display names: Work, Account 2, Work
+        dispatches = ["Work", "Account 2", "Work"]
+        res = verify_round_robin(dispatches, accounts)
+        self.assertTrue(res["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

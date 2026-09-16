@@ -286,6 +286,31 @@ def _find_account(pool, account):
                     (email and a.get("email") == email)), None)
 
 
+def display_account_name(account):
+    """
+    Returns the user-visible friendly display name for an account.
+    Never falls back to real email or values derived from email.
+    Fallback order:
+      1. Explicit friendly name / label ('name' field)
+      2. 'Account N' if account id matches 'acc_N'
+      3. 'Account' as generic safe fallback
+    """
+    if not isinstance(account, dict):
+        return "Account"
+
+    friendly = str(account.get("name") or "").strip()
+    if friendly:
+        return friendly
+
+    account_id = str(account.get("id") or "").strip()
+    if account_id.startswith("acc_"):
+        suffix = account_id[4:]
+        if suffix.isdigit():
+            return f"Account {int(suffix)}"
+
+    return "Account"
+
+
 TOKEN_FIELDS = ("access_token", "refresh_token", "token_expiry", "updated_at", "id_token")
 STATUS_FIELDS = ("status", "validation_url", "rate_limited_until")
 REFRESH_PERSIST_FIELDS = TOKEN_FIELDS + STATUS_FIELDS + ("last_quota",)
@@ -870,11 +895,9 @@ def do_login():
 
     jwt_payload = decode_jwt_payload(id_tok)
     email = jwt_payload.get("email") or f"user_{int(time.time())}@gmail.com"
-    name = jwt_payload.get("name") or email.split("@")[0]
 
     account_data = {
         "email": email,
-        "name": name,
         "refresh_token": refresh_tok,
         "access_token": access_tok,
         "token_expiry": time.time() + expires_in,
@@ -891,20 +914,21 @@ def do_login():
             existing.pop("rate_limited_until", None)
             return dict(existing)
         created[0] = True
-        entry = dict(account_data, id=_next_account_id(pool["accounts"]), request_count=0,
+        entry = dict(account_data, id=_next_account_id(pool["accounts"]), name=None, request_count=0,
                      gen_count=0, error_count=0, created_at=int(time.time()), last_quota={})
         pool["accounts"].append(entry)
         if not pool.get("active_account_id"):
             pool["active_account_id"] = entry["id"]
         return dict(entry)
     account_entry = pool_transaction(upsert)
+    disp_name = display_account_name(account_entry)
     if not created[0]:
-        print(f"{CLR_GREEN}✓ Updated existing account: {CLR_BOLD}{email}{CLR_RESET}")
+        print(f"{CLR_GREEN}✓ Updated existing account: {CLR_BOLD}{disp_name}{CLR_RESET}")
     else:
-        print(f"{CLR_GREEN}✓ Added new account: {CLR_BOLD}{email}{CLR_RESET}")
+        print(f"{CLR_GREEN}✓ Added new account: {CLR_BOLD}{disp_name}{CLR_RESET}")
 
     # Fetch initial quota
-    print(f"{CLR_CYAN}Probing quota for {email}...{CLR_RESET}")
+    print(f"{CLR_CYAN}Probing quota for {disp_name}...{CLR_RESET}")
     try:
         q = query_quota(account_entry)
         _persist_account_fields(account_entry, REFRESH_PERSIST_FIELDS)
@@ -928,9 +952,11 @@ def import_current():
     if not os.path.exists(AGY_TOKEN_FILE):
         print(f"{CLR_YELLOW}No existing {AGY_TOKEN_FILE} found to import.{CLR_RESET}")
         return False
+
     try:
         with open(AGY_TOKEN_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+
         tok = data.get("token", {})
         rf = tok.get("refresh_token")
         if not rf:
@@ -940,11 +966,9 @@ def import_current():
         id_tok = data.get("id_token", "")
         payload = decode_jwt_payload(id_tok)
         email = payload.get("email") or "primary_user@gmail.com"
-        name = payload.get("name") or email.split("@")[0]
 
         account_data = {
                 "email": email,
-                "name": name,
                 "refresh_token": rf,
                 "access_token": tok.get("access_token"),
                 "token_expiry": 0,
@@ -955,7 +979,7 @@ def import_current():
             if existing:
                 existing.update(account_data)
                 return dict(existing)
-            acc = dict(account_data, id=_next_account_id(pool["accounts"]), request_count=0,
+            acc = dict(account_data, id=_next_account_id(pool["accounts"]), name=None, request_count=0,
                        gen_count=0, error_count=0, created_at=int(time.time()), last_quota={})
             pool["accounts"].append(acc)
             if not pool.get("active_account_id"):
@@ -969,7 +993,7 @@ def import_current():
         except Exception:
             pass
 
-        print(f"{CLR_GREEN}✓ Successfully imported existing account: {CLR_BOLD}{email}{CLR_RESET}")
+        print(f"{CLR_GREEN}✓ Successfully imported existing account: {CLR_BOLD}{display_account_name(acc)}{CLR_RESET}")
         return True
     except Exception as e:
         print(f"{CLR_RED}[Error] Failed to import: {e}{CLR_RESET}")
@@ -1020,13 +1044,29 @@ def sync_active_agy_token_file():
 
 
 # ----------------- Quota Display & Account Management -----------------
-def list_accounts():
+def list_accounts(target=None):
     pool = load_pool()
     accounts = pool.get("accounts", [])
     if not accounts:
         print(f"\n{CLR_YELLOW}No accounts in pool yet.{CLR_RESET}")
         print(f"Run {CLR_BOLD}agy-pool login{CLR_RESET} or {CLR_BOLD}agy-pool import-current{CLR_RESET} to add accounts.\n")
         return
+
+    if target:
+        if str(target).isdigit():
+            idx = int(target) - 1
+            if 0 <= idx < len(accounts):
+                accounts = [accounts[idx]]
+            else:
+                print(f"{CLR_RED}[Error] Account '{target}' not found.{CLR_RESET}")
+                return
+        else:
+            found = next((a for a in accounts if a.get("id") == target or a.get("email") == target or a.get("name") == target), None)
+            if found:
+                accounts = [found]
+            else:
+                print(f"{CLR_RED}[Error] Account '{target}' not found.{CLR_RESET}")
+                return
 
     print(f"\n{CLR_BOLD}{CLR_CYAN}Refreshing quota for {len(accounts)} account(s)...{CLR_RESET}")
     # Refresh all quotas concurrently
@@ -1039,7 +1079,17 @@ def list_accounts():
         t.join(timeout=8)
 
     pool = load_pool()
-    accounts = pool.get("accounts", [])
+    if target:
+        # Re-fetch filtered account after quota refresh
+        all_accs = pool.get("accounts", [])
+        if str(target).isdigit():
+            idx = int(target) - 1
+            accounts = [all_accs[idx]] if 0 <= idx < len(all_accs) else []
+        else:
+            found = next((a for a in all_accs if a.get("id") == target or a.get("email") == target or a.get("name") == target), None)
+            accounts = [found] if found else []
+    else:
+        accounts = pool.get("accounts", [])
 
     daemon_running = is_daemon_running()
     gateway_status = f"{CLR_GREEN}RUNNING (127.0.0.1:{DEFAULT_PORT}){CLR_RESET}" if daemon_running else f"{CLR_DIM}STOPPED{CLR_RESET}"
@@ -1055,8 +1105,6 @@ def list_accounts():
     for i, acc in enumerate(accounts, start=1):
         acc_id = acc.get("id", f"acc_{i}")
         is_active = (acc_id == active_id)
-        email = acc.get("email", "Unknown")
-        name = acc.get("name")
         q = acc.get("last_quota", {})
         g5 = q.get("gemini_5h", {})
         gw = q.get("gemini_weekly", {})
@@ -1089,9 +1137,9 @@ def list_accounts():
             marker = f"{CLR_GREEN}* Active{CLR_RESET}"
         else:
             marker = f"{CLR_CYAN}Ready{CLR_RESET}"
-        name_str = f" ({name})" if name and name != email else ""
+        disp_name = display_account_name(acc)
 
-        print(f"{CLR_BOLD}[{i}] {email}{name_str}{CLR_RESET}  [{marker}]  Hits: {hits}")
+        print(f"{CLR_BOLD}[{i}] {disp_name}{CLR_RESET}  [{marker}]  Hits: {hits}")
 
         if status == "validation_required":
             print(f"    • Gemini 5-Hour: {CLR_YELLOW}[░░░░░░░░░░]  Action Required (Blocked){CLR_RESET}")
@@ -1140,7 +1188,7 @@ def remove_account(target):
             if 0 <= idx < len(accounts):
                 found = accounts[idx]
         else:
-            found = next((a for a in accounts if a.get("id") == target or a.get("email") == target), None)
+            found = next((a for a in accounts if a.get("id") == target or a.get("email") == target or a.get("name") == target), None)
         if not found:
             return None
         pool["accounts"] = [a for a in accounts if a.get("id") != found.get("id")]
@@ -1155,7 +1203,7 @@ def remove_account(target):
         sync_active_agy_token_file()
     except Exception:
         pass
-    print(f"{CLR_GREEN}✓ Removed account: {found.get('email')}{CLR_RESET}")
+    print(f"{CLR_GREEN}✓ Removed account: {display_account_name(found)}{CLR_RESET}")
     return True
 
 
@@ -1191,7 +1239,7 @@ def switch_account(target=None, silent=False):
             idx = int(target) - 1
             selected = choices[idx] if 0 <= idx < len(choices) else None
         else:
-            selected = next((a for a in choices if a.get("id") == target or a.get("email") == target), None)
+            selected = next((a for a in choices if a.get("id") == target or a.get("email") == target or a.get("name") == target), None)
         if selected:
             pool["active_account_id"] = selected["id"]
             return dict(selected)
@@ -1216,7 +1264,7 @@ def switch_account(target=None, silent=False):
     gw = q.get("gemini_weekly", {})
     g5_frac, gw_frac = _display_quota_fractions(q)
     if not silent:
-        print(f"{CLR_GREEN}✓ Active account switched to: {CLR_BOLD}{selected.get('email')}{CLR_RESET}")
+        print(f"{CLR_GREEN}✓ Active account switched to: {CLR_BOLD}{display_account_name(selected)}{CLR_RESET}")
         print(f"  • Gemini 5h    : {render_progress_bar(g5_frac)} (Resets {format_remaining_time(g5.get('reset_time'))})")
         print(f"  • Gemini Weekly: {render_progress_bar(gw_frac)} (Resets {format_remaining_time(gw.get('reset_time'))})")
     return True
@@ -1236,7 +1284,7 @@ def rename_account(target, new_name):
             if 0 <= idx < len(accounts):
                 found = accounts[idx]
         else:
-            found = next((a for a in accounts if a.get("id") == target or a.get("email") == target), None)
+            found = next((a for a in accounts if a.get("id") == target or a.get("email") == target or a.get("name") == target), None)
         if not found:
             return None
         found["name"] = new_name
@@ -1246,7 +1294,7 @@ def rename_account(target, new_name):
     if not found:
         print(f"{CLR_RED}[Error] Account '{target}' not found.{CLR_RESET}")
         return False
-    print(f"{CLR_GREEN}✓ Renamed account [{found.get('id')}] ({found.get('email')}) to: {CLR_BOLD}{new_name}{CLR_RESET}")
+    print(f"{CLR_GREEN}✓ Renamed account [{found.get('id')}] to: {CLR_BOLD}{new_name}{CLR_RESET}")
     return True
 
 
@@ -1292,7 +1340,7 @@ def do_verify(target=None):
                 target_idx = idx + 1
         else:
             for idx, a in enumerate(accounts):
-                if a.get("id") == target or a.get("email") == target:
+                if a.get("id") == target or a.get("email") == target or a.get("name") == target:
                     target_acc = a
                     target_idx = idx + 1
                     break
@@ -1312,8 +1360,9 @@ def do_verify(target=None):
         return False
 
     email = target_acc.get("email")
+    disp_target = display_account_name(target_acc)
     print(f"\n{CLR_BOLD}{CLR_CYAN}=== Google Security Verification ==={CLR_RESET}\n")
-    print(f"Target Account: {CLR_BOLD}[{target_idx}] {email}{CLR_RESET}")
+    print(f"Target Account: {CLR_BOLD}[{target_idx}] {disp_target}{CLR_RESET}")
     print(f"{CLR_YELLOW}Probing latest verification status and URL from Google Cloud Code...{CLR_RESET}")
 
     # Re-probe quota to get latest validation URL or clear restrictions if already solved
@@ -1322,7 +1371,7 @@ def do_verify(target=None):
     refreshed_acc = next((a for a in refreshed_pool.get("accounts", []) if a.get("id") == target_acc.get("id")), target_acc)
 
     if refreshed_acc.get("status") != "validation_required":
-        print(f"{CLR_GREEN}✓ Account {email} is verified and fully operational! No verification required.{CLR_RESET}\n")
+        print(f"{CLR_GREEN}✓ Account {display_account_name(refreshed_acc)} is verified and fully operational! No verification required.{CLR_RESET}\n")
         return True
 
     v_url = refreshed_acc.get("validation_url")
@@ -1330,7 +1379,7 @@ def do_verify(target=None):
         print(f"{CLR_YELLOW}Google did not return a validation URL. Please try logging in again via 'agy-pool login'.{CLR_RESET}\n")
         return False
 
-    if "&Email=" not in v_url and "&login_hint=" not in v_url:
+    if email and "&Email=" not in v_url and "&login_hint=" not in v_url:
         v_url += f"&Email={urllib.parse.quote(email)}"
 
     print(f"\n{CLR_GREEN}✓ Security verification URL retrieved:{CLR_RESET}")
@@ -1351,7 +1400,7 @@ def do_verify(target=None):
         print(f"{CLR_YELLOW}Could not open browser automatically. Please copy the URL above and open it manually.{CLR_RESET}")
 
     print(f"\n{CLR_BOLD}Instructions:{CLR_RESET}")
-    print(f"  1. In the browser, make sure you are logged into {CLR_BOLD}{email}{CLR_RESET}.")
+    print(f"  1. In the browser, make sure you are logged into {CLR_BOLD}{disp_target}{CLR_RESET}.")
     print(f"  2. Complete the Google account verification on screen.")
     print(f"  3. Wait until redirected to 'auth_success_gemini' (Verification Successful).")
     print()
@@ -1363,12 +1412,12 @@ def do_verify(target=None):
             print()
             return False
 
-        print(f"\n{CLR_CYAN}Re-probing quota for {email}...{CLR_RESET}")
+        print(f"\n{CLR_CYAN}Re-probing quota for {disp_target}...{CLR_RESET}")
         query_quota(refreshed_acc)
         final_pool = load_pool()
         final_acc = next((a for a in final_pool.get("accounts", []) if a.get("id") == target_acc.get("id")), target_acc)
         if final_acc.get("status") != "validation_required":
-            print(f"{CLR_GREEN}{CLR_BOLD}🎉 Verification Successful! Account {email} is now fully operational!{CLR_RESET}\n")
+            print(f"{CLR_GREEN}{CLR_BOLD}🎉 Verification Successful! Account {display_account_name(final_acc)} is now fully operational!{CLR_RESET}\n")
         else:
             print(f"{CLR_YELLOW}Account still appears restricted. If you just completed verification, wait a few moments and run 'agy-pool quota'.{CLR_RESET}\n")
 
@@ -1657,7 +1706,7 @@ def import_pool(file_path, password=None, replace=False, skip_existing=False):
 
     pool = load_pool()
     active_acc = next((a for a in pool.get("accounts", []) if a.get("id") == active_id), None)
-    active_str = f" ({active_acc.get('email')})" if active_acc else ""
+    active_str = f" ({display_account_name(active_acc)})" if active_acc else ""
 
     print(f"\n{CLR_GREEN}✓ Import completed successfully:{CLR_RESET}")
     print(f"  • Added: {CLR_BOLD}{added}{CLR_RESET} new account(s)")
@@ -2429,7 +2478,7 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                 at = refresh_token(acc)
             except Exception as e:
                 last_error = e
-                sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY WARN] Token refresh failed for {acc.get('email')}: {e}. Switching to next account...\n")
+                sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY WARN] Token refresh failed for {display_account_name(acc)}: {e}. Switching to next account...\n")
                 sys.stderr.flush()
                 self._record_auth_error(acc)
                 continue
@@ -2448,7 +2497,7 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
             try:
                 with urllib.request.urlopen(req, timeout=300) as resp:
                     status = resp.status
-                    sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY] {self.command} {path.split('/')[-1]} -> {acc.get('email')} (Status: {status})\n")
+                    sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY] {self.command} {path.split('/')[-1]} -> {display_account_name(acc)} (Status: {status})\n")
                     sys.stderr.flush()
 
                     resp_content_type = str(resp.headers.get("Content-Type", "")).lower()
@@ -2475,27 +2524,27 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                     pass
                 finally:
                     e.close()
-                sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY ERROR] {self.command} {path.split('/')[-1]} -> {acc.get('email')} HTTP {e.code}\n")
+                sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY ERROR] {self.command} {path.split('/')[-1]} -> {display_account_name(acc)} HTTP {e.code}\n")
                 sys.stderr.flush()
 
                 # Failover on Google Security Validation Required
                 if _is_validation_error(e.code, err_body):
                     self._record_validation_error(acc, err_body)
-                    sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [FAILOVER] Account {acc.get('email')} requires account verification! Auto-switching to next account...\n")
+                    sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [FAILOVER] Account {display_account_name(acc)} requires account verification! Auto-switching to next account...\n")
                     sys.stderr.flush()
                     continue
 
                 # Failover on 429 (ResourceExhausted / Quota Exceeded) or 403 quota exhaustion
                 elif _is_quota_error(e.code, err_body):
                     delay = self._record_quota_error(acc, e.headers)
-                    sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [FAILOVER] Account {acc.get('email')} hit rate limit/quota error! Cooldown {delay}s. Auto-switching to next account...\n")
+                    sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [FAILOVER] Account {display_account_name(acc)} hit rate limit/quota error! Cooldown {delay}s. Auto-switching to next account...\n")
                     sys.stderr.flush()
                     continue
 
                 # Failover on 401 Unauthenticated or disabled account
                 elif _is_auth_error(e.code, err_body):
                     self._record_auth_error(acc)
-                    sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [FAILOVER] Account {acc.get('email')} auth/permission failure! Auto-switching to next account...\n")
+                    sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [FAILOVER] Account {display_account_name(acc)} auth/permission failure! Auto-switching to next account...\n")
                     sys.stderr.flush()
                     continue
 
@@ -2510,7 +2559,7 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
             except Exception as e:
                 last_error = e
-                sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY EXCEPTION] {self.command} {path.split('/')[-1]} -> {acc.get('email')}: {e}\n")
+                sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY EXCEPTION] {self.command} {path.split('/')[-1]} -> {display_account_name(acc)}: {e}\n")
                 sys.stderr.flush()
                 try:
                     self.close_connection = True
@@ -2811,7 +2860,7 @@ def run_doctor():
             active_str = ""
             for a in accounts:
                 if a.get("id") == active_id:
-                    active_str = f" | Active: {a.get('email')}"
+                    active_str = f" | Active: {display_account_name(a)}"
                     break
 
             print(f"  {CLR_GREEN}✓{CLR_RESET} Account Pool: {len(accounts)} account(s) configured ({perm_str}){active_str}")
@@ -3076,22 +3125,23 @@ def main():
     # import-current
     subparsers.add_parser("import-current", help="Import current account from existing antigravity token")
     # list / quota / status
-    subparsers.add_parser("list", aliases=["ls", "quota"], help="List accounts and display quota dashboard")
+    list_p = subparsers.add_parser("list", aliases=["ls", "quota"], help="List accounts and display quota dashboard")
+    list_p.add_argument("target", nargs="?", default=None, help="Optional account index, name, or email")
     # strategy
     strat_p = subparsers.add_parser("strategy", aliases=["strat"], help="View or update load balancing strategy (max_quota, least_used, round_robin)")
     strat_p.add_argument("name", nargs="?", default=None, help="Strategy name ('max_quota', 'least_used', 'round_robin')")
     # rename
     ren_p = subparsers.add_parser("rename", help="Rename an account display name or friendly label")
-    ren_p.add_argument("target", help="Account index or email")
+    ren_p.add_argument("target", help="Account index, name, or email")
     ren_p.add_argument("name", help="New account label / name")
     # doctor
     subparsers.add_parser("doctor", aliases=["check", "health"], help="Run comprehensive system and environment diagnostics")
     # remove
-    rm_p = subparsers.add_parser("remove", aliases=["rm"], help="Remove an account by index or email")
-    rm_p.add_argument("target", help="Account index or email")
+    rm_p = subparsers.add_parser("remove", aliases=["rm"], help="Remove an account by index, name, or email")
+    rm_p.add_argument("target", help="Account index, name, or email")
     # switch
-    sw_p = subparsers.add_parser("switch", help="Switch current active account (auto or index/email)")
-    sw_p.add_argument("target", nargs="?", default="auto", help="Account index, email, or 'auto'")
+    sw_p = subparsers.add_parser("switch", help="Switch current active account (auto or index/name/email)")
+    sw_p.add_argument("target", nargs="?", default="auto", help="Account index, name, email, or 'auto'")
     # export / backup
     exp_p = subparsers.add_parser("export", aliases=["backup"], help="Export and backup accounts pool to JSON or encrypted bundle")
     exp_p.add_argument("file", nargs="?", default=None, help="Output file path (default: agy-pool-backup-<timestamp>.json, or '-' for stdout)")
@@ -3106,7 +3156,7 @@ def main():
     imp_p.add_argument("--skip-existing", action="store_true", help="Skip existing accounts instead of updating them")
     # verify
     ver_p = subparsers.add_parser("verify", help="Open Google security verification URL for restricted account")
-    ver_p.add_argument("target", nargs="?", default=None, help="Account index or email (defaults to first restricted account)")
+    ver_p.add_argument("target", nargs="?", default=None, help="Account index, name, or email (defaults to first restricted account)")
     # log / logs
     log_p = subparsers.add_parser("log", aliases=["logs"], help="View, follow, or manage gateway proxy logs")
     log_p.add_argument("-n", "--lines", type=int, default=20, help="Number of lines to display (default: 20)")
@@ -3136,7 +3186,7 @@ def main():
     elif cmd == "import-current":
         import_current()
     elif cmd in ["list", "ls", "quota"]:
-        list_accounts()
+        list_accounts(getattr(args, "target", None))
     elif cmd in ["strategy", "strat"]:
         if manage_strategy(args.name) is False:
             sys.exit(1)

@@ -1958,6 +1958,142 @@ class AgyPoolTest(unittest.TestCase):
         ordered_2 = agy_pool.order_candidates([acc_2, acc_1], strategy="max_quota", now=now)
         self.assertEqual([x["id"] for x in ordered_2], ["second", "first"])
 
+    def test_display_account_name_resolution(self):
+        # 1. Explicit friendly name
+        self.assertEqual(agy_pool.display_account_name({"name": "Work", "id": "acc_1", "email": "user@secret.com"}), "Work")
+        self.assertEqual(agy_pool.display_account_name({"name": "  Project Lead  ", "id": "acc_2"}), "Project Lead")
+        # 2. Safe fallback for acc_N
+        self.assertEqual(agy_pool.display_account_name({"name": None, "id": "acc_1", "email": "user@secret.com"}), "Account 1")
+        self.assertEqual(agy_pool.display_account_name({"name": "", "id": "acc_42", "email": "user@secret.com"}), "Account 42")
+        # 3. Generic safe fallback
+        self.assertEqual(agy_pool.display_account_name({"name": None, "id": "custom_uuid", "email": "user@secret.com"}), "Account")
+        self.assertEqual(agy_pool.display_account_name({}), "Account")
+        self.assertEqual(agy_pool.display_account_name(None), "Account")
+        self.assertEqual(agy_pool.display_account_name("invalid"), "Account")
+
+    def test_list_accounts_privacy_and_target_filtering(self):
+        acc1 = account("acc_1")
+        acc1["email"] = "supersecret_alpha@example.org"
+        acc1["name"] = "Production Cloud"
+        acc1["gen_count"] = 12
+
+        acc2 = account("acc_2")
+        acc2["email"] = "confidential_beta@enterprise.com"
+        acc2["name"] = None
+        acc2["gen_count"] = 7
+
+        self.save_accounts([acc1, acc2], active="acc_1")
+
+        # Full listing
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=None), \
+             mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.list_accounts()
+        output = buf.getvalue()
+
+        self.assertIn("[1] Production Cloud", output)
+        self.assertIn("[2] Account 2", output)
+        self.assertNotIn("supersecret_alpha@example.org", output)
+        self.assertNotIn("supersecret_alpha", output)
+        self.assertNotIn("confidential_beta@enterprise.com", output)
+        self.assertNotIn("confidential_beta", output)
+
+        # Filtered by target index
+        buf_idx = io.StringIO()
+        with mock.patch("sys.stdout", buf_idx), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=None), \
+             mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.list_accounts("1")
+        out_idx = buf_idx.getvalue()
+        self.assertIn("[1] Production Cloud", out_idx)
+        self.assertNotIn("Account 2", out_idx)
+        self.assertNotIn("supersecret_alpha", out_idx)
+
+        # Filtered by email target input (matching succeeds, but email is NEVER echoed in output)
+        buf_email = io.StringIO()
+        with mock.patch("sys.stdout", buf_email), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=None), \
+             mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.list_accounts("confidential_beta@enterprise.com")
+        out_email = buf_email.getvalue()
+        self.assertIn("Account 2", out_email)
+        self.assertNotIn("Production Cloud", out_email)
+        self.assertNotIn("confidential_beta@enterprise.com", out_email)
+        self.assertNotIn("confidential_beta", out_email)
+
+        # Filtered by friendly name target input
+        buf_name = io.StringIO()
+        with mock.patch("sys.stdout", buf_name), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=None), \
+             mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.list_accounts("Production Cloud")
+        out_name = buf_name.getvalue()
+        self.assertIn("[1] Production Cloud", out_name)
+        self.assertNotIn("Account 2", out_name)
+        self.assertNotIn("supersecret_alpha", out_name)
+
+    def test_account_management_privacy_with_real_email_targets(self):
+        acc1 = account("acc_1")
+        acc1["email"] = "alice_dev@corp.internal"
+        acc1["name"] = None
+
+        acc2 = account("acc_2")
+        acc2["email"] = "bob_ops@corp.internal"
+        acc2["name"] = None
+
+        self.save_accounts([acc1, acc2], active="acc_1")
+
+        # switch using real email target
+        buf_sw = io.StringIO()
+        with mock.patch("sys.stdout", buf_sw), mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.switch_account("bob_ops@corp.internal")
+        out_sw = buf_sw.getvalue()
+        self.assertIn("Account 2", out_sw)
+        self.assertNotIn("bob_ops@corp.internal", out_sw)
+        self.assertNotIn("bob_ops", out_sw)
+        self.assertEqual(agy_pool.load_pool()["active_account_id"], "acc_2")
+
+        # rename using real email target
+        buf_ren = io.StringIO()
+        with mock.patch("sys.stdout", buf_ren):
+            agy_pool.rename_account("bob_ops@corp.internal", "Operations Lead")
+        out_ren = buf_ren.getvalue()
+        self.assertIn("Operations Lead", out_ren)
+        self.assertIn("acc_2", out_ren)
+        self.assertNotIn("bob_ops@corp.internal", out_ren)
+        self.assertNotIn("bob_ops", out_ren)
+        self.assertEqual(agy_pool.load_pool()["accounts"][1]["name"], "Operations Lead")
+
+        # switch using new friendly name
+        buf_sw_name = io.StringIO()
+        with mock.patch("sys.stdout", buf_sw_name), mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.switch_account("Operations Lead")
+        out_sw_name = buf_sw_name.getvalue()
+        self.assertIn("Operations Lead", out_sw_name)
+        self.assertNotIn("bob_ops", out_sw_name)
+
+        # remove using real email target
+        buf_rm = io.StringIO()
+        with mock.patch("sys.stdout", buf_rm):
+            agy_pool.remove_account("alice_dev@corp.internal")
+        out_rm = buf_rm.getvalue()
+        self.assertIn("Account 1", out_rm)
+        self.assertNotIn("alice_dev@corp.internal", out_rm)
+        self.assertNotIn("alice_dev", out_rm)
+        pool = agy_pool.load_pool()
+        self.assertEqual(len(pool["accounts"]), 1)
+        self.assertEqual(pool["accounts"][0]["name"], "Operations Lead")
+
+        # remove using friendly name
+        buf_rm_name = io.StringIO()
+        with mock.patch("sys.stdout", buf_rm_name):
+            agy_pool.remove_account("Operations Lead")
+        out_rm_name = buf_rm_name.getvalue()
+        self.assertIn("Operations Lead", out_rm_name)
+        self.assertNotIn("bob_ops", out_rm_name)
+        self.assertEqual(len(agy_pool.load_pool()["accounts"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

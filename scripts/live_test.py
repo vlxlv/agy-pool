@@ -29,12 +29,94 @@ ANSI_ESCAPE_RE = re.compile(
 
 # Pattern matching account header in `agy-pool list`
 # Example: [1] user@example.com (Display Name)  [* Active]  Hits: 5
+# Example: [1] Account 1  [* Active]  Hits: 5
+# Example: [1] Work  [* Active]  Hits: 5
 ACCOUNT_HEADER_RE = re.compile(
-    r'^\s*\[(\d+)\]\s+(\S+)(.*?)\s+\[([^\]]+)\]\s+Hits:\s+(\d+)\s*$'
+    r'^\s*\[(\d+)\]\s+(.*?)\s+\[([^\]]+)\]\s+Hits:\s+(\d+)\s*$'
 )
 
 QUOTA_5H_RE = re.compile(r'Gemini 5-Hour:\s+\[.*?\]\s+([\d\.]+)%(?:\s+\(Resets\s+([^)]+)\))?')
 QUOTA_WEEKLY_RE = re.compile(r'Gemini Weekly:\s+\[.*?\]\s+([\d\.]+)%(?:\s+\(Resets\s+([^)]+)\))?')
+
+
+def display_account_name(account: Optional[Dict[str, Any]]) -> str:
+    """
+    Returns the user-visible friendly display name for an account.
+    Never falls back to real email or values derived from email.
+    Fallback order:
+      1. Explicit friendly name / label ('name' field)
+      2. 'Account N' if account id matches 'acc_N'
+      3. 'Account' as generic safe fallback
+    """
+    if not isinstance(account, dict):
+        return "Account"
+
+    friendly = str(account.get("name") or "").strip()
+    if friendly:
+        return friendly
+
+    account_id = str(account.get("id") or "").strip()
+    if account_id.startswith("acc_"):
+        suffix = account_id[4:]
+        if suffix.isdigit():
+            return f"Account {int(suffix)}"
+
+    return "Account"
+
+
+def account_matches(account: Optional[Dict[str, Any]], ident: Optional[str]) -> bool:
+    """
+    Check whether an account matches a dispatch or command identifier.
+    Matches by display_account_name, display_name, name, email, or id.
+    """
+    if not isinstance(account, dict) or not ident:
+        return False
+    candidates = {
+        display_account_name(account),
+        account.get("display_name"),
+        account.get("name"),
+        account.get("email"),
+        account.get("id"),
+    }
+    return ident in candidates
+
+
+def account_primary_ident(account: Dict[str, Any], known_dispatches: Optional[List[str]] = None) -> str:
+    """
+    Return the primary string identifier representing an account for verification.
+    If known_dispatches is provided and a candidate matches, returns that candidate.
+    Otherwise returns display_name or explicit name if present, or email if present (legacy fixtures),
+    or display_account_name.
+    """
+    if not isinstance(account, dict):
+        return "Account"
+
+    disp = display_account_name(account)
+    candidates = []
+    if disp and disp != "Account":
+        candidates.append(disp)
+    if account.get("name"):
+        candidates.append(account["name"])
+    if account.get("display_name"):
+        candidates.append(account["display_name"])
+    if account.get("email"):
+        candidates.append(account["email"])
+    if account.get("id"):
+        candidates.append(account["id"])
+    candidates.append(disp)
+
+    if known_dispatches:
+        for c in candidates:
+            if c in known_dispatches:
+                return c
+
+    if account.get("display_name"):
+        return account["display_name"]
+    if account.get("name"):
+        return account["name"]
+    if account.get("email"):
+        return account["email"]
+    return disp
 
 
 def _parse_human_reset_to_seconds(reset_str: Optional[str]) -> Optional[float]:
@@ -65,16 +147,19 @@ def _parse_human_reset_to_seconds(reset_str: Optional[str]) -> Optional[float]:
 
 # Patterns for agy-pool gateway proxy log lines
 LOG_PROXY_RE = re.compile(
-    r'^\[(?P<ts>[^\]]+)\]\s+\[PROXY\]\s+(?P<method>\S+)\s+(?P<endpoint>\S+)\s+->\s+(?P<account>\S+)\s+\(Status:\s+(?P<status>\d+)\)'
+    r'^\[(?P<ts>[^\]]+)\]\s+\[PROXY\]\s+(?P<method>\S+)\s+(?P<endpoint>\S+)\s+->\s+(?P<account>.+?)\s+\(Status:\s+(?P<status>\d+)\)'
 )
 LOG_FAILOVER_RE = re.compile(
+    r'^\[(?P<ts>[^\]]+)\]\s+\[FAILOVER\]\s+Account\s+(?P<account>.+?)\s+(?P<reason>(?:hit|requires|auth/permission|\S+ed|\S+s)\b.*$)'
+)
+LOG_FAILOVER_FALLBACK_RE = re.compile(
     r'^\[(?P<ts>[^\]]+)\]\s+\[FAILOVER\]\s+Account\s+(?P<account>\S+)\s+(?P<reason>.*)'
 )
 LOG_PROXY_ERROR_RE = re.compile(
-    r'^\[(?P<ts>[^\]]+)\]\s+\[PROXY ERROR\]\s+(?P<method>\S+)\s+(?P<endpoint>\S+)\s+->\s+(?P<account>\S+)\s+HTTP\s+(?P<status>\d+)'
+    r'^\[(?P<ts>[^\]]+)\]\s+\[PROXY ERROR\]\s+(?P<method>\S+)\s+(?P<endpoint>\S+)\s+->\s+(?P<account>.+?)\s+HTTP\s+(?P<status>\d+)'
 )
 LOG_PROXY_EXC_RE = re.compile(
-    r'^\[(?P<ts>[^\]]+)\]\s+\[PROXY EXCEPTION\]\s+(?P<method>\S+)\s+(?P<endpoint>\S+)\s+->\s+(?P<account>\S+):\s+(?P<error>.*)'
+    r'^\[(?P<ts>[^\]]+)\]\s+\[PROXY EXCEPTION\]\s+(?P<method>\S+)\s+(?P<endpoint>\S+)\s+->\s+(?P<account>.+?):\s+(?P<error>.*)'
 )
 
 # Authoritative generation endpoint identifiers based on production SmartProxyHandler.handle_proxy()
@@ -143,6 +228,7 @@ def parse_accounts(text: str) -> List[Dict[str, Any]]:
                         "id": acc.get("id", f"acc_{i}"),
                         "email": acc.get("email", ""),
                         "name": acc.get("name"),
+                        "display_name": display_account_name(acc),
                         "active": (acc.get("id") == data.get("active_account_id")),
                         "status": status,
                         "is_cooling": is_cooling,
@@ -170,11 +256,25 @@ def parse_accounts(text: str) -> List[Dict[str, Any]]:
 
         header_match = ACCOUNT_HEADER_RE.match(line)
         if header_match:
-            idx_str, email, name_part, marker, hits_str = header_match.groups()
-            name_part = name_part.strip()
+            idx_str, ident_part, marker, hits_str = header_match.groups()
+            ident_part = ident_part.strip()
             display_name = None
-            if name_part.startswith("(") and name_part.endswith(")"):
-                display_name = name_part[1:-1].strip()
+            email = ""
+            name = None
+
+            legacy_m = re.match(r'^(\S+@\S+)\s+\((.+)\)$', ident_part)
+            if legacy_m:
+                email = legacy_m.group(1).strip()
+                name = legacy_m.group(2).strip()
+                display_name = name
+            elif "@" in ident_part and " " not in ident_part:
+                email = ident_part.strip()
+                display_name = email
+                name = None
+            else:
+                display_name = ident_part
+                if ident_part != f"Account {idx_str}" and ident_part != "Account":
+                    name = ident_part
 
             marker = marker.strip()
             is_active = "* Active" in marker
@@ -205,7 +305,8 @@ def parse_accounts(text: str) -> List[Dict[str, Any]]:
                 "index": int(idx_str),
                 "id": f"acc_{idx_str}",
                 "email": email,
-                "name": display_name,
+                "name": name,
+                "display_name": display_name,
                 "active": is_active,
                 "status": status,
                 "is_cooling": is_cooling,
@@ -443,18 +544,21 @@ def analyze_hits_delta(
     Calculates per-account delta, total delta, GCD of non-zero deltas,
     and normalized delta units.
     """
-    before_map = {a.get("email") or a.get("id"): a.get("hits", 0) for a in before_accounts}
-    after_map = {a.get("email") or a.get("id"): a.get("hits", 0) for a in after_accounts}
+    def _account_key(a):
+        return a.get("email") or a.get("display_name") or a.get("name") or a.get("id") or "account"
+
+    before_map = {_account_key(a): a.get("hits", 0) for a in before_accounts}
+    after_map = {_account_key(a): a.get("hits", 0) for a in after_accounts}
 
     deltas = {}
     details = []
     all_keys = []
     for a in before_accounts:
-        k = a.get("email") or a.get("id")
+        k = _account_key(a)
         if k and k not in all_keys:
             all_keys.append(k)
     for a in after_accounts:
-        k = a.get("email") or a.get("id")
+        k = _account_key(a)
         if k and k not in all_keys:
             all_keys.append(k)
 
@@ -508,14 +612,20 @@ def verify_round_robin(
     if not eligible:
         return {"passed": False, "reason": "No eligible accounts available for round_robin rotation"}
 
-    eligible_emails = [a.get("email") or a.get("id") for a in eligible]
-    n_eligible = len(eligible_emails)
+    eligible_keys = [account_primary_ident(a, dispatches) for a in eligible]
+    n_eligible = len(eligible_keys)
+
+    def _find_pos(target_d: str) -> int:
+        for i, a in enumerate(eligible):
+            if target_d == eligible_keys[i] or account_matches(a, target_d):
+                return i
+        return -1
 
     # If only 1 eligible account, all dispatches must hit that account
     if n_eligible == 1:
-        expected = eligible_emails[0]
+        expected = eligible_keys[0]
         for idx, d in enumerate(dispatches):
-            if d != expected:
+            if d != expected and not account_matches(eligible[0], d):
                 return {
                     "passed": False,
                     "reason": f"Step {idx}: expected single account '{expected}', got '{d}'",
@@ -529,26 +639,26 @@ def verify_round_robin(
 
     # Verify every dispatch is an eligible account
     for idx, d in enumerate(dispatches):
-        if d not in eligible_emails:
+        if _find_pos(d) == -1:
             return {
                 "passed": False,
-                "reason": f"Step {idx}: dispatched account '{d}' is not in eligible accounts {eligible_emails}",
+                "reason": f"Step {idx}: dispatched account '{d}' is not in eligible accounts {eligible_keys}",
                 "step": idx,
             }
 
     # If initial_last_id is known, check that first dispatch starts immediately after it.
     # If initial_last_id is stale/not in eligible, production falls back to eligible[0].
-    start_pos = eligible_emails.index(dispatches[0])
+    start_pos = _find_pos(dispatches[0])
     if initial_last_id:
         found = False
         for i, a in enumerate(eligible):
-            if a.get("id") == initial_last_id or a.get("email") == initial_last_id:
+            if account_matches(a, initial_last_id):
                 found = True
                 expected_start_pos = (i + 1) % n_eligible
                 if start_pos != expected_start_pos:
                     return {
                         "passed": False,
-                        "reason": f"Initial step: expected rotation after '{initial_last_id}' -> '{eligible_emails[expected_start_pos]}', got '{dispatches[0]}'",
+                        "reason": f"Initial step: expected rotation after '{initial_last_id}' -> '{eligible_keys[expected_start_pos]}', got '{dispatches[0]}'",
                         "step": 0,
                     }
                 break
@@ -557,7 +667,7 @@ def verify_round_robin(
             if start_pos != 0:
                 return {
                     "passed": False,
-                    "reason": f"Initial step: stale cursor '{initial_last_id}' expected fallback to '{eligible_emails[0]}', got '{dispatches[0]}'",
+                    "reason": f"Initial step: stale cursor '{initial_last_id}' expected fallback to '{eligible_keys[0]}', got '{dispatches[0]}'",
                     "step": 0,
                 }
 
@@ -565,16 +675,16 @@ def verify_round_robin(
     cur_pos = start_pos
     for idx in range(1, len(dispatches)):
         expected_pos = (cur_pos + 1) % n_eligible
-        actual_pos = eligible_emails.index(dispatches[idx])
+        actual_pos = _find_pos(dispatches[idx])
         if actual_pos != expected_pos:
             return {
                 "passed": False,
                 "reason": (
-                    f"Step {idx}: rotation broken. Expected '{eligible_emails[expected_pos]}', "
+                    f"Step {idx}: rotation broken. Expected '{eligible_keys[expected_pos]}', "
                     f"got '{dispatches[idx]}'"
                 ),
                 "step": idx,
-                "expected": eligible_emails[expected_pos],
+                "expected": eligible_keys[expected_pos],
                 "actual": dispatches[idx],
             }
         cur_pos = actual_pos
@@ -730,10 +840,19 @@ def verify_least_used(
         return {"passed": False, "reason": "No eligible accounts available for least_used"}
 
     # Track simulated hits
-    sim_hits = {a.get("email") or a.get("id"): a.get("hits", 0) for a in eligible}
+    sim_hits = {account_primary_ident(a, dispatches): a.get("hits", 0) for a in eligible}
 
     for idx, d in enumerate(dispatches):
-        if d not in sim_hits:
+        matched_key = None
+        matched_acc = None
+        for a in eligible:
+            k = account_primary_ident(a, dispatches)
+            if k == d or account_matches(a, d):
+                matched_key = k
+                matched_acc = a
+                break
+
+        if not matched_key or matched_key not in sim_hits:
             return {
                 "passed": False,
                 "reason": f"Step {idx}: dispatched account '{d}' is not in eligible candidates",
@@ -741,7 +860,7 @@ def verify_least_used(
             }
 
         min_hits_val = min(sim_hits.values())
-        actual_hits = sim_hits[d]
+        actual_hits = sim_hits[matched_key]
 
         # Chosen account must have had minimum hits (or tied for minimum)
         if actual_hits > min_hits_val:
@@ -761,7 +880,7 @@ def verify_least_used(
         # Check production tie-breaking among candidates with equal min hits:
         # Sort by higher capacity pace / quota, then stable account ID
         min_accounts = [
-            a for a in eligible if sim_hits[a.get("email") or a.get("id")] == min_hits_val
+            a for a in eligible if sim_hits[account_primary_ident(a, dispatches)] == min_hits_val
         ]
         def _lu_tie_key(a):
             cap = compute_capacity_state(a, now=now)
@@ -773,11 +892,11 @@ def verify_least_used(
                 a.get("id", "")
             )
         min_accounts.sort(key=_lu_tie_key)
-        expected_top = min_accounts[0].get("email") or min_accounts[0].get("id")
+        expected_top = account_primary_ident(min_accounts[0], dispatches)
 
-        if d != expected_top and len(min_accounts) > 1:
+        if not account_matches(min_accounts[0], d) and len(min_accounts) > 1:
             top_cap = compute_capacity_state(min_accounts[0], now=now)
-            actual_acc = next((a for a in min_accounts if (a.get("email") == d or a.get("id") == d)), None)
+            actual_acc = matched_acc
             actual_cap = compute_capacity_state(actual_acc, now=now) if actual_acc else None
 
             if actual_acc and _lu_tie_key(actual_acc) == _lu_tie_key(min_accounts[0]):
@@ -810,7 +929,7 @@ def verify_least_used(
                 }
 
         # Increment simulated hits for next step
-        sim_hits[d] += 1
+        sim_hits[matched_key] += 1
 
     return {
         "passed": True,
@@ -859,13 +978,13 @@ def verify_max_quota(
         key=_mq_key,
         reverse=True
     )
-    top_account = sorted_eligible[0].get("email") or sorted_eligible[0].get("id")
+    top_account = account_primary_ident(sorted_eligible[0], dispatches)
 
     # In max_quota without cooldown/failover, dispatches should go to top candidate
     for idx, d in enumerate(dispatches):
-        if d != top_account:
+        if d != top_account and not account_matches(sorted_eligible[0], d):
             top_cap = compute_capacity_state(sorted_eligible[0], now=now)
-            actual_acc = next((a for a in eligible if a.get("email") == d or a.get("id") == d), None)
+            actual_acc = next((a for a in eligible if account_matches(a, d)), None)
             actual_cap = compute_capacity_state(actual_acc, now=now) if actual_acc else None
 
             # If CLI reset-time parsing is too coarse to reproduce an extremely close production comparison exactly,
