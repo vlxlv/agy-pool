@@ -32,6 +32,7 @@ import getpass
 import http.client
 import tempfile
 import email.utils
+import errno
 from datetime import datetime, timezone
 
 try:
@@ -1923,10 +1924,58 @@ def _hop_by_hop_names(headers):
     return names
 
 
+UNCOMMITTED_ERRNOS = {
+    errno.ECONNREFUSED,
+    errno.ENETUNREACH,
+    errno.EHOSTUNREACH,
+    errno.ENETDOWN,
+    errno.EADDRNOTAVAIL,
+}
+
+
 def _is_timeout_error(error):
     if isinstance(error, (socket.timeout, TimeoutError)):
         return True
-    return isinstance(error, urllib.error.URLError) and isinstance(error.reason, (socket.timeout, TimeoutError))
+    if isinstance(error, urllib.error.URLError) and isinstance(error.reason, (socket.timeout, TimeoutError)):
+        return True
+    reason = getattr(error, "reason", error)
+    if isinstance(reason, str) and "timed out" in reason.lower():
+        return True
+    return False
+
+
+def _is_uncommitted_transport_error(error):
+    """
+    Return True if the transport failure is provably uncommitted, meaning
+    the request was never transmitted to the upstream server.
+    """
+    if isinstance(error, urllib.error.HTTPError):
+        return False
+    if _is_timeout_error(error):
+        return False
+
+    target = error.reason if isinstance(error, urllib.error.URLError) else error
+
+    if isinstance(target, (ConnectionRefusedError, socket.gaierror, ssl.SSLError)):
+        return True
+
+    err_no = getattr(target, "errno", None)
+    if err_no in UNCOMMITTED_ERRNOS:
+        return True
+
+    if isinstance(target, str):
+        low = target.lower()
+        if any(msg in low for msg in (
+            "connection refused",
+            "name or service not known",
+            "nodename nor servname provided",
+            "network is unreachable",
+            "no route to host",
+            "network is down",
+        )):
+            return True
+
+    return False
 
 
 WINDOW_5H_SECS = 18000.0   # 5 hours
@@ -2423,6 +2472,13 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                     stored["last_quota"]["remaining_fraction"] = 0.0
         pool_transaction(update)
 
+    def _record_transport_error(self, account):
+        def update(pool):
+            stored = _find_account(pool, account)
+            if stored:
+                stored["error_count"] = stored.get("error_count", 0) + 1
+        pool_transaction(update)
+
     def handle_proxy(self):
         parsed = urllib.parse.urlsplit(self.path)
         path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
@@ -2484,7 +2540,10 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                 last_error = e
                 sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY WARN] Token refresh failed for {display_account_name(acc)}: {e}. Switching to next account...\n")
                 sys.stderr.flush()
-                self._record_auth_error(acc)
+                if _is_uncommitted_transport_error(e):
+                    self._record_transport_error(acc)
+                else:
+                    self._record_auth_error(acc)
                 continue
 
             target_url = f"{BACKEND_URL_BASE}{path}"
@@ -2559,10 +2618,14 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                         pass
                     return
 
-            except (BrokenPipeError, ConnectionResetError):
-                return
             except Exception as e:
                 last_error = e
+                if _is_uncommitted_transport_error(e):
+                    self._record_transport_error(acc)
+                    sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [FAILOVER] Account {display_account_name(acc)} failed with uncommitted transport error: {e}. Auto-switching to next account...\n")
+                    sys.stderr.flush()
+                    continue
+
                 sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY EXCEPTION] {self.command} {path.split('/')[-1]} -> {display_account_name(acc)}: {e}\n")
                 sys.stderr.flush()
                 try:

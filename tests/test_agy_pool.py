@@ -1,6 +1,8 @@
 import base64
 import contextlib
 import email.message
+import errno
+import ssl
 import http.client
 import http.server
 import importlib.machinery
@@ -2417,6 +2419,174 @@ class AgyPoolTest(unittest.TestCase):
         self.assertEqual(acc2["name"], "Standby Beta")
         self.assertEqual(acc2["rate_limited_until"], cooldown_target)
         self.assertEqual(acc2["last_quota"]["gemini_5h"]["fraction"], 0.40)
+
+    def test_uncommitted_transport_error_classification(self):
+        """
+        Verify that only pre-connect / connection-establishment errors qualify as
+        provably uncommitted, while timeouts and post-connect errors are not.
+        """
+        # Provably uncommitted failures
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            urllib.error.URLError(ssl.SSLError("TLS handshake failed"))))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            urllib.error.URLError(OSError(errno.ENETUNREACH, "Network is unreachable"))))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            urllib.error.URLError(OSError(errno.EHOSTUNREACH, "No route to host"))))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            ConnectionRefusedError(111, "Connection refused")))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            socket.gaierror(-2, "Name or service not known")))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            ssl.SSLError("TLS handshake failed")))
+
+        # Ambiguous failures (must NOT qualify as uncommitted)
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            socket.timeout("timed out")))
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            TimeoutError("timed out")))
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            urllib.error.URLError(socket.timeout("timed out"))))
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            http.client.RemoteDisconnected("Remote end closed connection without response")))
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            ConnectionResetError("Connection reset by peer")))
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            http.client.IncompleteRead(b"", 100)))
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            http.client.BadStatusLine("???")))
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            urllib.error.HTTPError("http://example.test", 403, "Forbidden", {}, None)))
+
+    def test_uncommitted_transport_failure_fails_over_transparently(self):
+        """
+        When candidate A encounters a provably uncommitted transport failure,
+        the proxy transparently fails over to candidate B and succeeds.
+        """
+        self.save_accounts([account("a"), account("b")])
+        proxy = self.start_server(agy_pool.SmartProxyHandler)
+        calls = []
+
+        class DummyResponse:
+            status = 200
+            def __init__(self, body=b'{"result": "success_b"}'):
+                self.headers = email.message.Message()
+                self.headers["Content-Type"] = "application/json"
+                self._body = io.BytesIO(body)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self, size=-1):
+                return self._body.read(size)
+            def read1(self, size=-1):
+                return self._body.read(size)
+
+        def urlopen_mock(req, *args, **kwargs):
+            auth = req.get_header("Authorization")
+            calls.append(auth)
+            if "token-a" in auth:
+                raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+            return DummyResponse()
+
+        with mock.patch.object(agy_pool.urllib.request, "urlopen", urlopen_mock):
+            status, body, _ = self.request(proxy, "/v1internal:generateContent")
+
+        self.assertEqual(status, 200)
+        self.assertIn(b"success_b", body)
+        self.assertEqual(calls, ["Bearer token-a", "Bearer token-b"])
+
+        # Account A recorded transport error but was NOT locked out as auth error
+        pool = agy_pool.load_pool()
+        acc_a = next(a for a in pool["accounts"] if a["id"] == "a")
+        acc_b = next(a for a in pool["accounts"] if a["id"] == "b")
+        self.assertEqual(acc_a.get("error_count"), 1)
+        self.assertIsNone(acc_a.get("status"))
+        self.assertIsNone(acc_a.get("rate_limited_until"))
+        self.assertEqual(acc_b.get("gen_count"), 1)
+
+    def test_all_accounts_uncommitted_transport_failure_returns_503(self):
+        """
+        When all candidate accounts fail with uncommitted transport failures,
+        the proxy returns 503 indicating all accounts exhausted/unavailable.
+        """
+        self.save_accounts([account("a"), account("b")])
+        proxy = self.start_server(agy_pool.SmartProxyHandler)
+        calls = []
+
+        def urlopen_mock(req, *args, **kwargs):
+            calls.append(req.get_header("Authorization"))
+            raise urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
+
+        with mock.patch.object(agy_pool.urllib.request, "urlopen", urlopen_mock):
+            status, body, _ = self.request(proxy, "/v1internal:generateContent")
+
+        self.assertEqual(status, 503)
+        self.assertIn(b"All accounts in pool exhausted or unavailable", body)
+        self.assertEqual(len(calls), 2)
+
+    def test_ambiguous_generation_failure_preserves_no_replay_remote_disconnected(self):
+        """
+        When a generation request fails with RemoteDisconnected (upstream closed after sending),
+        the failure is ambiguous: proxy must NOT replay to candidate B, preserving no-replay semantics.
+        """
+        self.save_accounts([account("a"), account("b")])
+        proxy = self.start_server(agy_pool.SmartProxyHandler)
+        calls = []
+
+        def urlopen_mock(req, *args, **kwargs):
+            calls.append(req.get_header("Authorization"))
+            raise http.client.RemoteDisconnected("Remote end closed connection without response")
+
+        with mock.patch.object(agy_pool.urllib.request, "urlopen", urlopen_mock):
+            status, _, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+
+        self.assertEqual(status, 502)
+        # Only account A was called; account B was never called
+        self.assertEqual(calls, ["Bearer token-a"])
+
+    def test_uncommitted_token_refresh_error_does_not_set_auth_error_status(self):
+        """
+        When token refresh fails with an uncommitted transport error (e.g. DNS failure),
+        the account is NOT marked with status='auth_error' and proxy fails over to next account.
+        """
+        self.save_accounts([account("a"), account("b")])
+        proxy = self.start_server(agy_pool.SmartProxyHandler)
+
+        def refresh_mock(acc):
+            if acc["id"] == "a":
+                raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+            return "token-b"
+
+        class DummyResponse:
+            status = 200
+            def __init__(self, body=b'{"ok": true}'):
+                self.headers = email.message.Message()
+                self.headers["Content-Type"] = "application/json"
+                self._body = io.BytesIO(body)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self, size=-1):
+                return self._body.read(size)
+            def read1(self, size=-1):
+                return self._body.read(size)
+
+        with mock.patch.object(agy_pool, "refresh_token", refresh_mock), \
+             mock.patch.object(agy_pool.urllib.request, "urlopen", side_effect=lambda *args, **kwargs: DummyResponse()):
+            status, body, _ = self.request(proxy, "/v1internal:generateContent")
+
+        self.assertEqual(status, 200)
+        self.assertIn(b"ok", body)
+
+        pool = agy_pool.load_pool()
+        acc_a = next(a for a in pool["accounts"] if a["id"] == "a")
+        self.assertNotEqual(acc_a.get("status"), "auth_error")
+        self.assertIsNone(acc_a.get("rate_limited_until"))
 
 
 if __name__ == "__main__":
