@@ -27,7 +27,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from agy_pool import config, storage, auth, accounts, quota, scheduler, proxy, daemon, diagnostics
+from agy_pool import config, storage, auth, accounts, quota, scheduler, proxy, daemon, diagnostics, cli
 
 SCRIPT = os.path.join(ROOT, "bin", "agy-pool")
 loader = importlib.machinery.SourceFileLoader("agy_pool_bin", SCRIPT)
@@ -3707,6 +3707,114 @@ class AgyPoolTest(unittest.TestCase):
              mock.patch("ssl.create_default_context"):
             diagnostics.run_doctor()
         self.assertIn("Session Continuity: Database not yet created", buf_nodb.getvalue())
+
+    def test_cp6b_modularization_cli_and_thin_entrypoint(self):
+        """Comprehensive verification for CP6B: cli module extraction and thin entrypoint."""
+        # 1. Symbol export parity between bin/agy-pool and agy_pool.cli
+        for sym in (
+            "find_real_agy_binary",
+            "get_installed_agy_version",
+            "INSTALLED_AGY_VER",
+            "ARCH",
+            "OS_TYPE",
+            "DEFAULT_UA",
+            "list_accounts",
+            "manage_strategy",
+            "show_logs",
+            "find_latest_conversation_for_dir",
+            "resolve_continue_arg",
+            "run_agy_with_lb",
+            "run_agy_direct",
+            "main",
+        ):
+            self.assertEqual(getattr(agy_pool, sym), getattr(cli, sym), f"CLI symbol parity failed: {sym}")
+
+        # 2. Entrypoint isolation & resolver verification
+        ep = daemon.get_entrypoint_path()
+        self.assertTrue(os.path.exists(ep))
+        self.assertTrue(ep.endswith("bin/agy-pool") or ep.endswith("bin/agy-pool.py"))
+        self.assertNotIn("cli.py", ep)
+
+        # 3. Binary discovery self-recursion guard
+        self_paths = cli._get_self_paths()
+        self.assertTrue(any("bin/agy-pool" in p for p in self_paths))
+        self.assertTrue(any("cli.py" in p for p in self_paths))
+        # Simulated AGY_BIN pointing to bin/agy-pool itself must be rejected
+        with mock.patch.dict(os.environ, {"AGY_BIN": ep}):
+            resolved_bin = cli.find_real_agy_binary()
+            self.assertNotEqual(resolved_bin, ep)
+
+        # 4. Thin entrypoint line count verification (< 350 lines, down from 889)
+        with open(SCRIPT, "r", encoding="utf-8") as f:
+            entrypoint_lines = f.readlines()
+        self.assertLess(len(entrypoint_lines), 350, f"bin/agy-pool line count is too large: {len(entrypoint_lines)}")
+
+        # 5. Resolve continue arg behavior
+        # No continue arg
+        orig_args = ["--verbose", "run"]
+        self.assertEqual(cli.resolve_continue_arg(orig_args), orig_args)
+
+        # Explicit --conversation
+        explicit_args = ["--conversation", "my-conv-123", "-c"]
+        self.assertEqual(cli.resolve_continue_arg(explicit_args), explicit_args)
+        explicit_eq_args = ["--conversation=my-conv-123", "--continue"]
+        self.assertEqual(cli.resolve_continue_arg(explicit_eq_args), explicit_eq_args)
+
+        # SQLite lookup with active record
+        db_dir = os.path.join(self.temp.name, ".gemini", "antigravity-cli")
+        os.makedirs(db_dir, exist_ok=True)
+        db_file = os.path.join(db_dir, "conversation_summaries.db")
+        workspace_dir = os.path.join(self.temp.name, "my_project")
+        os.makedirs(workspace_dir, exist_ok=True)
+
+        with sqlite3.connect(db_file) as conn:
+            conn.execute("CREATE TABLE conversation_summaries (conversation_id, title, workspace_uris, last_modified_time)")
+            conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?, ?)",
+                         ("c-auto-1", "Auto Title", json.dumps([f"file://{workspace_dir}"]), 500))
+
+        # Test resolution when in workspace_dir
+        with mock.patch("os.getcwd", return_value=workspace_dir), \
+             mock.patch("sys.stderr", io.StringIO()):
+            resolved = cli.resolve_continue_arg(["-c", "--extra"])
+            self.assertEqual(resolved, ["--conversation", "c-auto-1", "--extra"])
+
+        # Non-POSIX safe presence lock handling without fcntl
+        with mock.patch("os.getcwd", return_value=workspace_dir), \
+             mock.patch.object(config, "HAS_FCNTL", False), \
+             mock.patch.object(config, "fcntl", None), \
+             mock.patch("sys.stderr", io.StringIO()):
+            resolved_nofcntl = cli.resolve_continue_arg(["--continue"])
+            self.assertEqual(resolved_nofcntl, ["--conversation", "c-auto-1"])
+
+        # 6. Strategy management view, update, invalid
+        self.save_accounts([account("acc_1")])
+        self.assertEqual(cli.manage_strategy(), "max_quota")
+        self.assertTrue(cli.manage_strategy("least_used"))
+        self.assertEqual(storage.load_pool().get("strategy"), "least_used")
+        self.assertFalse(cli.manage_strategy("invalid_strategy_xyz"))
+
+        # 7. List accounts target filtering
+        acc1 = account("a")
+        acc1["name"] = "Alice"
+        acc2 = account("b")
+        acc2["name"] = "Bob"
+        self.save_accounts([acc1, acc2])
+
+        buf_filter = io.StringIO()
+        with mock.patch("sys.stdout", buf_filter), \
+             mock.patch.object(cli, "_do_safe_quota"):
+            cli.list_accounts("Alice")
+        out_filter = buf_filter.getvalue()
+        self.assertIn("Alice", out_filter)
+        self.assertNotIn("Bob", out_filter)
+
+        # 8. Show logs missing file and rotation
+        buf_nolog = io.StringIO()
+        missing_log = os.path.join(self.temp.name, "nonexistent.log")
+        with mock.patch.object(config, "LOG_FILE", missing_log), \
+             mock.patch("sys.stdout", buf_nolog):
+            cli.show_logs()
+        self.assertIn("Log file does not exist yet", buf_nolog.getvalue())
 
 
 if __name__ == "__main__":
