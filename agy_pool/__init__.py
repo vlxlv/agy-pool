@@ -8,5 +8,6 @@ from agy_pool import storage
 from agy_pool import auth
 from agy_pool import accounts
 from agy_pool import quota
+from agy_pool import scheduler
 
-__all__ = ["config", "storage", "auth", "accounts", "quota"]
+__all__ = ["config", "storage", "auth", "accounts", "quota", "scheduler"]

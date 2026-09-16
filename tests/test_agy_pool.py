@@ -27,7 +27,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from agy_pool import config, storage, auth, accounts, quota
+from agy_pool import config, storage, auth, accounts, quota, scheduler
 
 SCRIPT = os.path.join(ROOT, "bin", "agy-pool")
 loader = importlib.machinery.SourceFileLoader("agy_pool_bin", SCRIPT)
@@ -3168,6 +3168,279 @@ class AgyPoolTest(unittest.TestCase):
                 self.assertEqual(getattr(agy_pool, sym), getattr(quota, sym), f"Quota symbol parity failed: {sym}")
         finally:
             self.refresh_patch.start()
+
+    def test_cp4_modularization_scheduler_extraction(self):
+        """Comprehensive verification for CP4 scheduler modularization and semantics preservation."""
+        now = 1780000000.0
+
+        # Section 15: Differential & Parity Check across representative fixtures
+        healthy1 = {
+            "id": "h1",
+            "last_quota": {
+                "gemini_5h": {"fraction": 0.9, "reset_time": "2026-09-17T00:00:00Z"},
+                "gemini_weekly": {"fraction": 0.8, "reset_time": "2026-09-24T00:00:00Z"},
+                "updated_at": now - 10,
+            },
+            "gen_count": 2,
+        }
+        healthy2 = {
+            "id": "h2",
+            "last_quota": {
+                "gemini_5h": {"fraction": 0.7, "reset_time": "2026-09-17T00:00:00Z"},
+                "gemini_weekly": {"fraction": 0.75, "reset_time": "2026-09-24T00:00:00Z"},
+                "updated_at": now - 100,
+            },
+            "gen_count": 1,
+        }
+        partial = {
+            "id": "p1",
+            "last_quota": {"gemini_5h": {"fraction": 0.95}, "updated_at": now - 20},
+            "gen_count": 0,
+        }
+        unknown = {"id": "u1", "last_quota": {}, "gen_count": 0}
+        depleted = {
+            "id": "d1",
+            "last_quota": {"gemini_5h": {"fraction": 0.003}, "gemini_weekly": {"fraction": 0.5}},
+            "gen_count": 0,
+        }
+        cooldown = {
+            "id": "c1",
+            "rate_limited_until": now + 60,
+            "last_quota": {"gemini_5h": {"fraction": 0.9}, "gemini_weekly": {"fraction": 0.9}},
+            "gen_count": 0,
+        }
+        restricted = {
+            "id": "r1",
+            "status": "validation_required",
+            "last_quota": {"gemini_5h": {"fraction": 0.9}, "gemini_weekly": {"fraction": 0.9}},
+            "gen_count": 0,
+        }
+        equal1 = {
+            "id": "e1",
+            "last_quota": {"gemini_5h": {"fraction": 0.8}, "gemini_weekly": {"fraction": 0.8}},
+            "gen_count": 5,
+        }
+        equal2 = {
+            "id": "e2",
+            "last_quota": {"gemini_5h": {"fraction": 0.8}, "gemini_weekly": {"fraction": 0.8}},
+            "gen_count": 5,
+        }
+
+        all_fixtures = [healthy1, healthy2, partial, unknown, depleted, cooldown, restricted, equal1, equal2]
+
+        for strat in ("max_quota", "least_used", "round_robin"):
+            for cursor in (None, "h1", "h2", "missing_cursor"):
+                p = {"round_robin_last_account_id": cursor}
+                order_mod = [a["id"] for a in scheduler.order_candidates(all_fixtures, strategy=strat, pool=p, now=now)]
+                order_bin = [a["id"] for a in agy_pool.order_candidates(all_fixtures, strategy=strat, pool=p, now=now)]
+                self.assertEqual(order_mod, order_bin, f"Parity mismatch for strategy {strat} with cursor {cursor}")
+
+        # Item A: compute_capacity_state exact math
+        acc_exact = {
+            "last_quota": {"gemini_5h": {"fraction": 0.8}, "gemini_weekly": {"fraction": 0.6}},
+            "gemini_5h_reset_sec": 9000,
+            "gemini_weekly_reset_sec": 302400,
+        }
+        cap = scheduler.compute_capacity_state(acc_exact, now=0)
+        self.assertEqual(cap["q5"], 0.8)
+        self.assertEqual(cap["q7"], 0.6)
+        self.assertAlmostEqual(cap["r5"], 0.5)
+        self.assertAlmostEqual(cap["r7"], 0.5)
+        self.assertAlmostEqual(cap["pace5"], 0.3)
+        self.assertAlmostEqual(cap["pace7"], 0.1)
+        self.assertAlmostEqual(cap["worst_pace"], 0.1)
+        self.assertAlmostEqual(cap["total_pace"], 0.4)
+        self.assertAlmostEqual(cap["raw_floor"], 0.6)
+        self.assertEqual(cap["known_window_count"], 2)
+        self.assertFalse(cap["is_depleted"])
+
+        # Item B: full precision ordering without float rounding
+        acc_prec_1 = {
+            "id": "p1",
+            "last_quota": {"gemini_5h": {"fraction": 0.500000000002}, "gemini_weekly": {"fraction": 0.500000000002}},
+            "gemini_5h_reset_sec": 9000,
+            "gemini_weekly_reset_sec": 302400,
+            "gen_count": 999,
+        }
+        acc_prec_2 = {
+            "id": "p2",
+            "last_quota": {"gemini_5h": {"fraction": 0.500000000001}, "gemini_weekly": {"fraction": 0.500000000001}},
+            "gemini_5h_reset_sec": 9000,
+            "gemini_weekly_reset_sec": 302400,
+            "gen_count": 0,
+        }
+        ord_prec = scheduler.order_candidates([acc_prec_2, acc_prec_1], strategy="max_quota", now=0)
+        self.assertEqual([a["id"] for a in ord_prec], ["p1", "p2"])
+
+        # Item C: worst_pace beats lower-priority fields
+        acc_c_wp = {
+            "id": "wp",
+            "last_quota": {"gemini_5h": {"fraction": 0.6}, "gemini_weekly": {"fraction": 0.6}},
+            "gemini_5h_reset_sec": 9000,
+            "gemini_weekly_reset_sec": 302400,
+            "gen_count": 999,
+        }
+        acc_c_other = {
+            "id": "other",
+            "last_quota": {"gemini_5h": {"fraction": 0.95}, "gemini_weekly": {"fraction": 0.5}},
+            "gemini_5h_reset_sec": 0,
+            "gemini_weekly_reset_sec": 302400,
+            "gen_count": 0,
+        }
+        ord_c = scheduler.order_candidates([acc_c_other, acc_c_wp], strategy="max_quota", now=0)
+        self.assertEqual([a["id"] for a in ord_c], ["wp", "other"])
+
+        # Item D: total_pace tie-break
+        acc_d_tot = {
+            "id": "tot",
+            "last_quota": {"gemini_5h": {"fraction": 0.5}, "gemini_weekly": {"fraction": 0.8}},
+            "gemini_5h_reset_sec": 9000,
+            "gemini_weekly_reset_sec": 302400,
+            "gen_count": 999,
+        }
+        acc_d_low = {
+            "id": "low",
+            "last_quota": {"gemini_5h": {"fraction": 0.5}, "gemini_weekly": {"fraction": 0.6}},
+            "gemini_5h_reset_sec": 9000,
+            "gemini_weekly_reset_sec": 302400,
+            "gen_count": 0,
+        }
+        ord_d = scheduler.order_candidates([acc_d_low, acc_d_tot], strategy="max_quota", now=0)
+        self.assertEqual([a["id"] for a in ord_d], ["tot", "low"])
+
+        # Item E: raw_floor tie-break
+        acc_e_flr = {
+            "id": "flr",
+            "last_quota": {"gemini_5h": {"fraction": 0.75}, "gemini_weekly": {"fraction": 0.75}},
+            "gemini_5h_reset_sec": 13500,
+            "gemini_weekly_reset_sec": 453600,
+            "gen_count": 999,
+        }
+        acc_e_low = {
+            "id": "low",
+            "last_quota": {"gemini_5h": {"fraction": 0.5}, "gemini_weekly": {"fraction": 0.5}},
+            "gemini_5h_reset_sec": 9000,
+            "gemini_weekly_reset_sec": 302400,
+            "gen_count": 0,
+        }
+        ord_e = scheduler.order_candidates([acc_e_low, acc_e_flr], strategy="max_quota", now=0)
+        self.assertEqual([a["id"] for a in ord_e], ["flr", "low"])
+
+        # Item F: Hits final tie-break
+        acc_f_fewer = {
+            "id": "fewer",
+            "last_quota": {"gemini_5h": {"fraction": 0.6}, "gemini_weekly": {"fraction": 0.6}},
+            "gemini_5h_reset_sec": 9000,
+            "gemini_weekly_reset_sec": 302400,
+            "gen_count": 5,
+        }
+        acc_f_more = {
+            "id": "more",
+            "last_quota": {"gemini_5h": {"fraction": 0.6}, "gemini_weekly": {"fraction": 0.6}},
+            "gemini_5h_reset_sec": 9000,
+            "gemini_weekly_reset_sec": 302400,
+            "gen_count": 10,
+        }
+        ord_f = scheduler.order_candidates([acc_f_more, acc_f_fewer], strategy="max_quota", now=0)
+        self.assertEqual([a["id"] for a in ord_f], ["fewer", "more"])
+
+        # Item G: exact full tie preserves stable order
+        acc_g_1 = {
+            "id": "g1",
+            "last_quota": {"gemini_5h": {"fraction": 0.6}, "gemini_weekly": {"fraction": 0.6}},
+            "gemini_5h_reset_sec": 9000,
+            "gemini_weekly_reset_sec": 302400,
+            "gen_count": 5,
+        }
+        acc_g_2 = {
+            "id": "g2",
+            "last_quota": {"gemini_5h": {"fraction": 0.6}, "gemini_weekly": {"fraction": 0.6}},
+            "gemini_5h_reset_sec": 9000,
+            "gemini_weekly_reset_sec": 302400,
+            "gen_count": 5,
+        }
+        self.assertEqual([a["id"] for a in scheduler.order_candidates([acc_g_1, acc_g_2], now=0)], ["g1", "g2"])
+        self.assertEqual([a["id"] for a in scheduler.order_candidates([acc_g_2, acc_g_1], now=0)], ["g2", "g1"])
+
+        # Item H & I: known quota vs unknown quota and partial quota confidence
+        acc_2win = {"id": "2win", "last_quota": {"gemini_5h": {"fraction": 0.5}, "gemini_weekly": {"fraction": 0.5}}}
+        acc_1win = {"id": "1win", "last_quota": {"gemini_5h": {"fraction": 0.99}}}
+        acc_0win = {"id": "0win", "last_quota": {}}
+        ord_win = scheduler.order_candidates([acc_0win, acc_1win, acc_2win], strategy="max_quota", now=0)
+        self.assertEqual([a["id"] for a in ord_win], ["2win", "1win", "0win"])
+
+        # Item J & K: fresh vs aging behavior and stale ranking
+        acc_fresh = {"id": "fresh", "last_quota": {"gemini_5h": {"fraction": 0.5}, "updated_at": now - 30}}
+        acc_aging = {"id": "aging", "last_quota": {"gemini_5h": {"fraction": 0.5}, "updated_at": now - 150}}
+        acc_stale = {"id": "stale", "last_quota": {"gemini_5h": {"fraction": 0.5}, "updated_at": now - 350}}
+        self.assertEqual(quota.quota_freshness_rank(acc_fresh, now=now), 2)
+        self.assertEqual(quota.quota_freshness_rank(acc_aging, now=now), 2)
+        self.assertEqual(quota.quota_freshness_rank(acc_stale, now=now), 1)
+        ord_stale = scheduler.order_candidates([acc_stale, acc_fresh], strategy="max_quota", now=now)
+        self.assertEqual([a["id"] for a in ord_stale], ["fresh", "stale"])
+
+        # Item L, M, N: depleted, cooldown, and restricted fallback tiers
+        acc_elig = {"id": "elig", "last_quota": {"gemini_5h": {"fraction": 0.5}}}
+        acc_dep = {"id": "dep", "last_quota": {"gemini_5h": {"fraction": 0.001}}}
+        acc_cd = {"id": "cd", "rate_limited_until": now + 60, "last_quota": {"gemini_5h": {"fraction": 0.9}}}
+        acc_restr = {"id": "restr", "status": "auth_error", "last_quota": {"gemini_5h": {"fraction": 0.9}}}
+        ord_tiers = scheduler.order_candidates([acc_restr, acc_cd, acc_dep, acc_elig], strategy="max_quota", now=now)
+        self.assertEqual([a["id"] for a in ord_tiers], ["elig", "dep", "cd", "restr"])
+
+        # Item O & P: least_used Hits primary behavior and capacity tie-break
+        acc_lu_1hit = {"id": "h_one", "gen_count": 1, "last_quota": {"gemini_5h": {"fraction": 0.1}}}
+        acc_lu_2hits = {"id": "h_two", "gen_count": 2, "last_quota": {"gemini_5h": {"fraction": 1.0}}}
+        ord_lu_hits = scheduler.order_candidates([acc_lu_2hits, acc_lu_1hit], strategy="least_used", now=0)
+        self.assertEqual([a["id"] for a in ord_lu_hits], ["h_one", "h_two"])
+
+        acc_lu_tie1 = {"id": "b_tie", "gen_count": 3, "last_quota": {"gemini_5h": {"fraction": 0.9}}}
+        acc_lu_tie2 = {"id": "a_tie", "gen_count": 3, "last_quota": {"gemini_5h": {"fraction": 0.5}}}
+        ord_lu_tie = scheduler.order_candidates([acc_lu_tie2, acc_lu_tie1], strategy="least_used", now=0)
+        self.assertEqual([a["id"] for a in ord_lu_tie], ["b_tie", "a_tie"])
+
+        # Item Q, R, S, T, U, V: Round Robin reservation, concurrency, failure, cursor preservation
+        rr_a = account("rr_a")
+        rr_b = account("rr_b")
+        rr_c = account("rr_c")
+        self.save_accounts([rr_a, rr_b, rr_c])
+        storage.pool_transaction(lambda p: p.update(strategy="round_robin", round_robin_last_account_id=None))
+
+        # Atomic reservation advances cursor before dispatch
+        cands1 = scheduler.reserve_round_robin_candidates(now=now)
+        self.assertEqual(cands1[0]["id"], "rr_a")
+        self.assertEqual(storage.load_pool().get("round_robin_last_account_id"), "rr_a")
+
+        cands2 = scheduler.reserve_round_robin_candidates(now=now)
+        self.assertEqual(cands2[0]["id"], "rr_b")
+        self.assertEqual(storage.load_pool().get("round_robin_last_account_id"), "rr_b")
+
+        cands3 = scheduler.reserve_round_robin_candidates(now=now)
+        self.assertEqual(cands3[0]["id"], "rr_c")
+        self.assertEqual(storage.load_pool().get("round_robin_last_account_id"), "rr_c")
+
+        cands4 = scheduler.reserve_round_robin_candidates(now=now)
+        self.assertEqual(cands4[0]["id"], "rr_a")
+        self.assertEqual(storage.load_pool().get("round_robin_last_account_id"), "rr_a")
+
+        # Stale/removed cursor gracefully defaults
+        storage.pool_transaction(lambda p: p.update(round_robin_last_account_id="nonexistent_id"))
+        cands_stale = scheduler.reserve_round_robin_candidates(now=now)
+        self.assertEqual(cands_stale[0]["id"], "rr_a")
+
+        # Non-RR strategies do NOT mutate RR cursor
+        storage.pool_transaction(lambda p: p.update(round_robin_last_account_id="rr_b"))
+        scheduler.order_candidates([rr_a, rr_b, rr_c], strategy="max_quota", pool=storage.load_pool(), now=now)
+        self.assertEqual(storage.load_pool().get("round_robin_last_account_id"), "rr_b")
+        scheduler.order_candidates([rr_a, rr_b, rr_c], strategy="least_used", pool=storage.load_pool(), now=now)
+        self.assertEqual(storage.load_pool().get("round_robin_last_account_id"), "rr_b")
+
+        # Item W: Symbol export identity
+        self.assertIs(agy_pool.VALID_STRATEGIES, scheduler.VALID_STRATEGIES)
+        self.assertIs(agy_pool.compute_capacity_state, scheduler.compute_capacity_state)
+        self.assertIs(agy_pool._get_remaining_fraction, scheduler._get_remaining_fraction)
+        self.assertIs(agy_pool.order_candidates, scheduler.order_candidates)
+        self.assertIs(agy_pool.reserve_round_robin_candidates, scheduler.reserve_round_robin_candidates)
+        self.assertIs(agy_pool.reserve_round_robin_account, scheduler.reserve_round_robin_account)
 
 
 if __name__ == "__main__":
