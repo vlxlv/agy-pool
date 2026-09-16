@@ -27,7 +27,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from agy_pool import config, storage, auth, accounts
+from agy_pool import config, storage, auth, accounts, quota
 
 SCRIPT = os.path.join(ROOT, "bin", "agy-pool")
 loader = importlib.machinery.SourceFileLoader("agy_pool_bin", SCRIPT)
@@ -3011,6 +3011,163 @@ class AgyPoolTest(unittest.TestCase):
             "decrypt_bundle", "export_pool", "import_pool",
         ):
             self.assertEqual(getattr(agy_pool, sym), getattr(accounts, sym), f"Accounts symbol parity failed: {sym}")
+
+    def test_cp3_modularization_quota_extraction(self):
+        """Comprehensive verification of Checkpoint 3: quota module extraction."""
+        # 1. Quota error classification & retry-after parsing
+        self.assertTrue(quota._is_quota_error(429, b"any body"))
+        self.assertTrue(quota._is_quota_error(403, b"RESOURCE_EXHAUSTED: daily limit reached"))
+        self.assertTrue(quota._is_quota_error(403, b"Quota Exceeded"))
+        self.assertFalse(quota._is_quota_error(403, b"Access Denied: forbidden"))
+        self.assertFalse(quota._is_quota_error(200, b"ok"))
+
+        # Retry-After parsing
+        self.assertEqual(quota._parse_retry_after({"Retry-After": "45"}), 45)
+        self.assertEqual(quota._parse_retry_after({"Retry-After": "2"}), 5)  # clamped min 5s
+        self.assertEqual(quota._parse_retry_after({"Retry-After": "999999"}), 86400)  # clamped max 24h
+        self.assertEqual(quota._parse_retry_after({"Retry-After": "invalid"}, default=120), 120)
+        self.assertEqual(quota._parse_retry_after({}, default=300), 300)
+
+        # Quota fraction parsing
+        self.assertEqual(quota._quota_fraction(0.75), 0.75)
+        self.assertEqual(quota._quota_fraction("0.5"), 0.5)
+        self.assertEqual(quota._quota_fraction(-0.1), 0.0)
+        self.assertEqual(quota._quota_fraction(1.5), 1.0)
+        self.assertIsNone(quota._quota_fraction(float("nan")))
+        self.assertIsNone(quota._quota_fraction(float("inf")))
+        self.assertIsNone(quota._quota_fraction("not-a-number"))
+
+        # Item 15: Unknown / Partial Quota Regressions
+        # A. Both 5H and weekly known
+        q_both = {
+            "gemini_5h": {"fraction": 0.8, "reset_time": "2026-09-17T00:00:00Z"},
+            "gemini_weekly": {"fraction": 0.5, "reset_time": "2026-09-24T00:00:00Z"},
+        }
+        cached_both = quota._cached_quota_state(q_both)
+        self.assertEqual(cached_both["gemini_5h"]["fraction"], 0.8)
+        self.assertEqual(cached_both["gemini_weekly"]["fraction"], 0.5)
+        quota._recompute_compat_quota(cached_both)
+        self.assertEqual(cached_both["remaining_fraction"], 0.5)
+        self.assertEqual(cached_both["reset_time"], "2026-09-24T00:00:00Z")
+
+        # B. Only 5H known, weekly unknown
+        q_5h_only = {"gemini_5h": {"fraction": 0.75, "reset_time": "2026-09-17T00:00:00Z"}}
+        cached_5h = quota._cached_quota_state(q_5h_only)
+        self.assertNotIn("gemini_weekly", cached_5h)
+        quota._recompute_compat_quota(cached_5h)
+        self.assertEqual(cached_5h["remaining_fraction"], 0.75)
+
+        # C. Only weekly known
+        q_w_only = {"gemini_weekly": {"fraction": 0.65, "reset_time": "2026-09-24T00:00:00Z"}}
+        cached_w = quota._cached_quota_state(q_w_only)
+        self.assertNotIn("gemini_5h", cached_w)
+        quota._recompute_compat_quota(cached_w)
+        self.assertEqual(cached_w["remaining_fraction"], 0.65)
+
+        # D. Fallback 5H response preserving cached weekly
+        acc_merge = account("merge_target")
+        acc_merge["last_quota"] = {"gemini_5h": {"fraction": 0.2}, "gemini_weekly": {"fraction": 0.7}}
+        merged_q = quota._cached_quota_state(acc_merge["last_quota"])
+        merged_q["gemini_5h"] = {"fraction": 0.9, "reset_time": "new-5h"}
+        quota._recompute_compat_quota(merged_q)
+        self.assertEqual(merged_q["gemini_5h"]["fraction"], 0.9)
+        self.assertEqual(merged_q["gemini_weekly"]["fraction"], 0.7)
+        self.assertEqual(merged_q["remaining_fraction"], 0.7)
+
+        # E. Complete refresh failure preserving cached quota
+        cached_before_fail = {"gemini_5h": {"fraction": 0.44}, "gemini_weekly": {"fraction": 0.33}}
+        fail_acc = account("fail_preserve")
+        fail_acc["last_quota"] = cached_before_fail
+        self.save_accounts([fail_acc])
+        with mock.patch.object(agy_pool, "query_quota", side_effect=OSError("offline")):
+            self.assertFalse(agy_pool._safe_quota(dict(fail_acc)))
+        self.assertEqual(storage.load_pool()["accounts"][0]["last_quota"], cached_before_fail)
+
+        # F. Legacy remaining_fraction-only state
+        legacy_state = {"remaining_fraction": 0.42, "reset_time": "2026-09-17T00:00:00Z"}
+        cached_leg = quota._cached_quota_state(legacy_state)
+        self.assertEqual(cached_leg["gemini_5h"]["fraction"], 0.42)
+        self.assertEqual(cached_leg["gemini_weekly"]["fraction"], 0.42)
+
+        # G. Known 100% distinct from unknown
+        cached_empty = quota._cached_quota_state({})
+        self.assertNotIn("gemini_5h", cached_empty)
+        self.assertNotIn("gemini_weekly", cached_empty)
+        cached_full = quota._cached_quota_state({"gemini_5h": {"fraction": 1.0}, "gemini_weekly": {"fraction": 1.0}})
+        self.assertEqual(cached_full["gemini_5h"]["fraction"], 1.0)
+        self.assertEqual(cached_full["gemini_weekly"]["fraction"], 1.0)
+
+        # H. Auth / validation unavailable states
+        restr_acc = account("restricted_q")
+        self.assertFalse(agy_pool.compute_capacity_state(restr_acc)["is_depleted"])
+        restr_acc["status"] = "validation_required"
+        restr_acc["last_quota"] = {"gemini_5h": {"fraction": 0.0}, "gemini_weekly": {"fraction": 0.0}}
+        self.assertTrue(agy_pool.compute_capacity_state(restr_acc)["is_depleted"])
+        self.assertEqual(agy_pool.order_candidates([restr_acc])[0]["status"], "validation_required")
+
+        # I. Depleted threshold behavior remains unchanged (<= 0.005)
+        dep_acc = account("dep_acc")
+        dep_acc["last_quota"] = {"gemini_5h": {"fraction": 0.004}, "gemini_weekly": {"fraction": 0.8}}
+        self.assertTrue(agy_pool.compute_capacity_state(dep_acc)["is_depleted"])
+
+        nondep_acc = account("nondep_acc")
+        nondep_acc["last_quota"] = {"gemini_5h": {"fraction": 0.006}, "gemini_weekly": {"fraction": 0.8}}
+        self.assertFalse(agy_pool.compute_capacity_state(nondep_acc)["is_depleted"])
+
+        # Item 16: Freshness / Backoff
+        now = time.time()
+        # A. fresh <= 60s
+        self.assertEqual(quota.quota_freshness({"last_quota": {"updated_at": now - 30}}, now=now)["class"], "fresh")
+        self.assertEqual(quota.quota_freshness_rank({"last_quota": {"updated_at": now - 30}}, now=now), 2)
+        self.assertFalse(quota.quota_refresh_needed({"last_quota": {"updated_at": now - 30}}, now=now))
+
+        # B. aging 61-300s
+        self.assertEqual(quota.quota_freshness({"last_quota": {"updated_at": now - 150}}, now=now)["class"], "aging")
+        self.assertEqual(quota.quota_freshness_rank({"last_quota": {"updated_at": now - 150}}, now=now), 2)
+        self.assertTrue(quota.quota_refresh_needed({"last_quota": {"updated_at": now - 150}}, now=now))
+
+        # C. stale > 300s
+        self.assertEqual(quota.quota_freshness({"last_quota": {"updated_at": now - 350}}, now=now)["class"], "stale")
+        self.assertEqual(quota.quota_freshness_rank({"last_quota": {"updated_at": now - 350}}, now=now), 1)
+        self.assertTrue(quota.quota_refresh_needed({"last_quota": {"updated_at": now - 350}}, now=now))
+
+        # D. unknown timestamp
+        self.assertEqual(quota.quota_freshness({}, now=now)["class"], "unknown")
+        self.assertEqual(quota.quota_freshness_rank({}, now=now), 0)
+        self.assertTrue(quota.quota_refresh_needed({}, now=now))
+
+        # E. Bounded backoff sequence
+        self.assertEqual(quota._QUOTA_REFRESH_BACKOFF, (30, 60, 120, 240, 300))
+
+        # F. Single-flight mutable state identity
+        self.assertIs(agy_pool._QUOTA_REFRESH_LOCK, quota._QUOTA_REFRESH_LOCK)
+        self.assertIs(agy_pool._QUOTA_REFRESH_IN_FLIGHT, quota._QUOTA_REFRESH_IN_FLIGHT)
+        self.assertIs(agy_pool._QUOTA_REFRESH_RETRY, quota._QUOTA_REFRESH_RETRY)
+        self.assertIs(agy_pool._QUOTA_REFRESH_BACKOFF, quota._QUOTA_REFRESH_BACKOFF)
+
+        # Formatting helpers
+        self.assertEqual(quota.format_remaining_time(now - 10), "Ready")
+        self.assertEqual(quota.format_remaining_time(None), "N/A")
+        self.assertTrue(quota.format_remaining_time(now + 120).startswith("in "))
+        self.assertIn("75.0%", quota.render_progress_bar(0.75))
+        self.assertIn("N/A", quota.render_progress_bar(None))
+
+        # Re-export parity between bin/agy-pool and agy_pool.quota
+        self.refresh_patch.stop()
+        try:
+            for sym in (
+                "QUOTA_FRESH_MAX_AGE", "QUOTA_AGING_MAX_AGE", "_QUOTA_REFRESH_BACKOFF",
+                "WINDOW_5H_SECS", "WINDOW_7D_SECS", "_is_quota_error", "_parse_retry_after",
+                "_quota_fraction", "_cached_quota_state", "_recompute_compat_quota",
+                "_fetch_available_models_quota", "query_quota", "format_remaining_time",
+                "render_progress_bar", "format_quota_age", "_display_quota_fractions",
+                "_format_account_quota_summary", "quota_freshness", "quota_refresh_needed",
+                "quota_freshness_rank", "schedule_quota_refresh", "_parse_iso_or_timestamp",
+                "_safe_quota",
+            ):
+                self.assertEqual(getattr(agy_pool, sym), getattr(quota, sym), f"Quota symbol parity failed: {sym}")
+        finally:
+            self.refresh_patch.start()
 
 
 if __name__ == "__main__":
