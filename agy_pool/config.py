@@ -13,7 +13,7 @@ except ImportError:
     fcntl = None
     HAS_FCNTL = False
 
-VERSION = "0.1.0-beta.1"
+VERSION = "0.1.0-beta.2"
 QUOTA_FRESH_MAX_AGE = 60
 QUOTA_AGING_MAX_AGE = 300
 _QUOTA_REFRESH_BACKOFF = (30, 60, 120, 240, 300)

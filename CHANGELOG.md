@@ -5,6 +5,32 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.2] - 2026-09-16
+
+### Added
+- **Modular Python Architecture**:
+  - Extracted modular package `agy_pool/` covering `config`, `storage`, `auth`, `accounts`, `quota`, `scheduler`, `proxy`, `daemon`, `diagnostics`, and `cli`.
+  - Reduced `bin/agy-pool` to a thin entrypoint and bootstrap layer with external execution compatibility.
+- **Persistent State Safety & Fail-Closed Test Guards**:
+  - Authoritative configuration deriving all state paths from a single source (`get_state_dir`, `get_accounts_file`).
+  - Strict isolation and fail-closed test harness guards preventing synthetic test writes to production state directories (`~/.gemini/agy-pool-accounts.json`).
+  - Production-home resolution independent of mutable `HOME` environment variable to prevent state corruption during testing or migration.
+- **Installer Lifecycle Hardening**:
+  - Isolated installer and upgrade test harness from host system paths (`fake_prefix`), ensuring robust symlink creation and reinstall verification.
+
+### Changed
+- **Quota Progress-Bar UI Refinement**:
+  - Refined terminal quota bar rendering with aligned heavy (`━`) and light (`─`) box-drawing characters, uncolored framing brackets, and dimmed unused tracks for consistent terminal display.
+
+### Fixed
+- **Transport Reliability & No-Replay Policy**:
+  - Preserved strict at-most-once non-replay safety semantics for downstream requests and in-flight transport failures to protect upstream account state and non-idempotent streams.
+
+### Validated
+- Comprehensive verification across 142 offline tests.
+- Side-by-side candidate gateway verification on port 8900 with isolated state, live quota refresh, real generation, and scheduler routing validation.
+- Zero-downtime production cold-start cutover on port 8899 preserving active sessions, rotation, and account credentials.
+
 ## [0.1.0-beta.1] - 2026-09-16
 
 ### Added
