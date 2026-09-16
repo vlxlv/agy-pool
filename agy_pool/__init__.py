@@ -11,5 +11,6 @@ from agy_pool import quota
 from agy_pool import scheduler
 from agy_pool import proxy
 from agy_pool import daemon
+from agy_pool import diagnostics
 
-__all__ = ["config", "storage", "auth", "accounts", "quota", "scheduler", "proxy", "daemon"]
+__all__ = ["config", "storage", "auth", "accounts", "quota", "scheduler", "proxy", "daemon", "diagnostics"]

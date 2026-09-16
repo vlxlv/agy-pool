@@ -27,7 +27,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from agy_pool import config, storage, auth, accounts, quota, scheduler, proxy, daemon
+from agy_pool import config, storage, auth, accounts, quota, scheduler, proxy, daemon, diagnostics
 
 SCRIPT = os.path.join(ROOT, "bin", "agy-pool")
 loader = importlib.machinery.SourceFileLoader("agy_pool_bin", SCRIPT)
@@ -3586,6 +3586,127 @@ class AgyPoolTest(unittest.TestCase):
             with open(config.PID_FILE, "w", encoding="utf-8") as f:
                 json.dump(meta, f)
             self.assertTrue(daemon.is_daemon_outdated())
+
+    def test_cp6a_modularization_diagnostics_extraction(self):
+        """Comprehensive verification for CP6A diagnostics modularization and system doctor preservation."""
+        # 1. Symbol export identity (Section 14 N)
+        self.assertIs(agy_pool.run_doctor, diagnostics.run_doctor)
+
+        # 2. All-healthy doctor execution (Section 14 A, B, G, H, J, L)
+        acc_work = account("acc_1")
+        acc_work["name"] = "Work Profile"
+        acc_work["email"] = "super_secret_dev_email@corp.internal"
+        self.save_accounts([acc_work], active="acc_1")
+
+        # Create session database with active records
+        db_dir = os.path.join(self.temp.name, ".gemini", "antigravity-cli")
+        os.makedirs(db_dir, exist_ok=True)
+        db_file = os.path.join(db_dir, "conversation_summaries.db")
+        with sqlite3.connect(db_file) as conn:
+            conn.execute("CREATE TABLE conversation_summaries (conversation_id, title, workspace_uris, last_modified_time)")
+            conn.execute("INSERT INTO conversation_summaries VALUES ('c1', 'T1', '[]', 100)")
+            conn.execute("INSERT INTO conversation_summaries VALUES ('c2', 'T2', '[]', 200)")
+
+        # Create dummy log file
+        log_file = os.path.join(self.temp.name, ".gemini", "agy-pool.log")
+        with open(log_file, "wb") as f:
+            f.write(b"x" * 2048)
+
+        fake_sock = mock.MagicMock()
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), \
+             mock.patch("socket.create_connection", return_value=fake_sock), \
+             mock.patch("ssl.create_default_context"), \
+             mock.patch.object(diagnostics, "_get_agy_binary", return_value="/mock/bin/agy"), \
+             mock.patch.object(diagnostics, "_get_installed_agy_version", return_value="1.9.0"), \
+             mock.patch.object(diagnostics, "_get_daemon_info", return_value={"pid": 4567, "version": config.VERSION, "script_mtime": 1000}), \
+             mock.patch.object(diagnostics, "_get_port_listening", return_value=True), \
+             mock.patch.object(diagnostics, "_get_daemon_outdated", return_value=False):
+            res = diagnostics.run_doctor()
+
+        self.assertTrue(res)
+        out = buf.getvalue()
+        self.assertIn("Antigravity System Doctor", out)
+        self.assertIn("Native Binary:", out)
+        self.assertIn("/mock/bin/agy", out)
+        self.assertIn("(v1.9.0)", out)
+        self.assertIn(f"Gateway Daemon: RUNNING (PID 4567 [v{config.VERSION}])", out)
+        self.assertIn("Account Pool: 1 account(s) configured (0o600) | Active: Work Profile", out)
+        self.assertIn("Cloud Code API: Reachable via TLS", out)
+        self.assertIn("Session Continuity: Database active (2 conversation(s) recorded)", out)
+        self.assertIn("Gateway Log: ", out)
+        self.assertIn("2.0 KB", out)
+        self.assertIn("All systems nominal! You are ready to use 'agy'.", out)
+
+        # 3. Privacy preservation (Section 14 M)
+        self.assertNotIn("super_secret_dev_email@corp.internal", out)
+
+        # 4. Daemon outdated warning (Section 14 C)
+        buf_outdated = io.StringIO()
+        with mock.patch("sys.stdout", buf_outdated), \
+             mock.patch("socket.create_connection", return_value=fake_sock), \
+             mock.patch("ssl.create_default_context"), \
+             mock.patch.object(diagnostics, "_get_daemon_info", return_value={"pid": 4567, "version": "0.0.1-old", "script_mtime": 100}), \
+             mock.patch.object(diagnostics, "_get_port_listening", return_value=True), \
+             mock.patch.object(diagnostics, "_get_daemon_outdated", return_value=True):
+            res_outdated = diagnostics.run_doctor()
+        self.assertTrue(res_outdated)
+        self.assertIn("outdated disk code", buf_outdated.getvalue())
+        self.assertIn("System operational with", buf_outdated.getvalue())
+
+        # 5. Account pool status categorization (Section 14 D, E, F)
+        now = time.time()
+        acc_restr = account("acc_restr")
+        acc_restr["status"] = "validation_required"
+        acc_cool = account("acc_cool")
+        acc_cool["rate_limited_until"] = now + 600
+        acc_exh = account("acc_exh")
+        acc_exh["last_quota"] = {"remaining_fraction": 0.001}
+        acc_ready = account("acc_ready")
+        acc_ready["last_quota"] = {"remaining_fraction": 0.8}
+        self.save_accounts([acc_restr, acc_cool, acc_exh, acc_ready])
+
+        buf_accounts = io.StringIO()
+        with mock.patch("sys.stdout", buf_accounts), \
+             mock.patch("socket.create_connection", return_value=fake_sock), \
+             mock.patch("ssl.create_default_context"):
+            res_accounts = diagnostics.run_doctor()
+        self.assertTrue(res_accounts)
+        out_acc = buf_accounts.getvalue()
+        self.assertIn("1 Ready", out_acc)
+        self.assertIn("1 Cooldown", out_acc)
+        self.assertIn("1 Exhausted", out_acc)
+        self.assertIn("1 Restricted", out_acc)
+        self.assertIn("Some accounts require verification or re-auth. Run 'agy-pool verify'.", out_acc)
+
+        # Empty pool reporting
+        self.save_accounts([])
+        buf_empty = io.StringIO()
+        with mock.patch("sys.stdout", buf_empty), \
+             mock.patch("socket.create_connection", return_value=fake_sock), \
+             mock.patch("ssl.create_default_context"):
+            res_empty = diagnostics.run_doctor()
+        self.assertTrue(res_empty)
+        self.assertIn("Pool is empty. Run 'agy-pool login' or 'agy-pool import-current'.", buf_empty.getvalue())
+
+        # 6. TLS unreachable non-fatal warning (Section 14 I)
+        buf_tls = io.StringIO()
+        with mock.patch("sys.stdout", buf_tls), \
+             mock.patch("socket.create_connection", side_effect=OSError("network unreachable")), \
+             mock.patch("ssl.create_default_context"):
+            res_tls = diagnostics.run_doctor()
+        self.assertTrue(res_tls)
+        self.assertIn("Cloud Code API: Connection to", buf_tls.getvalue())
+        self.assertIn("failed: network unreachable", buf_tls.getvalue())
+
+        # 7. Session DB missing / error states (Section 14 K)
+        os.unlink(db_file)
+        buf_nodb = io.StringIO()
+        with mock.patch("sys.stdout", buf_nodb), \
+             mock.patch("socket.create_connection", return_value=fake_sock), \
+             mock.patch("ssl.create_default_context"):
+            diagnostics.run_doctor()
+        self.assertIn("Session Continuity: Database not yet created", buf_nodb.getvalue())
 
 
 if __name__ == "__main__":
