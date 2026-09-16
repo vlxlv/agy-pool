@@ -60,13 +60,24 @@ MAX_LOG_BYTES = int(os.environ.get("AGY_LOG_MAX_BYTES", DEFAULT_MAX_LOG_BYTES))
 BACKUP_LOG_COUNT = int(os.environ.get("AGY_LOG_BACKUP_COUNT", DEFAULT_BACKUP_LOG_COUNT))
 
 # ----------------- Path Configuration & Test Isolation Guard -----------------
-_REAL_PRODUCTION_GEMINI_DIR = (
-    os.environ.get("AGY_REAL_GEMINI_DIR")
-    or os.path.abspath(os.path.expanduser("~/.gemini"))
-)
+def _detect_real_production_gemini_dir():
+    explicit = os.environ.get("AGY_REAL_GEMINI_DIR")
+    if explicit:
+        return os.path.realpath(os.path.abspath(os.path.expanduser(explicit)))
+    try:
+        import pwd
+        real_home = pwd.getpwuid(os.getuid()).pw_dir
+        if real_home:
+            return os.path.realpath(os.path.join(real_home, ".gemini"))
+    except Exception:
+        pass
+    return os.path.realpath(os.path.abspath(os.path.expanduser("~/.gemini")))
+
+
+_REAL_PRODUCTION_GEMINI_DIR = _detect_real_production_gemini_dir()
 _FORBIDDEN_WRITE_DIRS = {
-    os.path.realpath(_REAL_PRODUCTION_GEMINI_DIR),
-    os.path.abspath(os.path.expanduser(_REAL_PRODUCTION_GEMINI_DIR)),
+    _REAL_PRODUCTION_GEMINI_DIR,
+    os.path.abspath(_REAL_PRODUCTION_GEMINI_DIR),
 }
 _TEST_MODE = bool(os.environ.get("AGY_TEST_MODE") == "1")
 

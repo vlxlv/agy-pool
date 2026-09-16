@@ -143,6 +143,7 @@ is_test_mode = config.is_test_mode
 set_test_mode = config.set_test_mode
 register_forbidden_path = config.register_forbidden_path
 _assert_safe_write_path = config._assert_safe_write_path
+_detect_real_production_gemini_dir = config._detect_real_production_gemini_dir
 
 
 def _sync_paths_from_config():

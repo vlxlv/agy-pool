@@ -2701,6 +2701,75 @@ class AgyPoolTest(unittest.TestCase):
             with storage._file_lock(fallback_target):
                 self.assertTrue(os.path.exists(fallback_target))
 
+    def test_production_gemini_dir_detection_independent_of_home(self):
+        """Verify production home is derived independently of mutable HOME, protecting production while allowing isolated test paths."""
+        # 1. Overridden HOME does not change real production home
+        with mock.patch.dict(os.environ, {"HOME": "/tmp/test-home"}):
+            detected = config._detect_real_production_gemini_dir()
+            self.assertFalse(detected.startswith("/tmp/test-home"))
+            fake_pw = mock.Mock(pw_dir="/home/mockuser")
+            with mock.patch("pwd.getpwuid", return_value=fake_pw):
+                mock_detected = config._detect_real_production_gemini_dir()
+                self.assertEqual(mock_detected, "/home/mockuser/.gemini")
+
+        # Fallback when pwd is unavailable
+        with mock.patch.dict(os.environ, {"HOME": "/home/fallbackuser"}, clear=False), \
+             mock.patch.dict("sys.modules", {"pwd": None}):
+            fallback_detected = config._detect_real_production_gemini_dir()
+            self.assertTrue(fallback_detected.endswith(".gemini"))
+
+        # 2. Isolated AGY_GEMINI_DIR remains writable in test mode
+        self.assertTrue(config.is_test_mode())
+        isolated_dir = os.path.join(self.temp.name, "isolated_home", ".gemini")
+        os.makedirs(isolated_dir, mode=0o700, exist_ok=True)
+        isolated_file = os.path.join(isolated_dir, "test.json")
+        config._assert_safe_write_path(isolated_file)
+        storage._atomic_json_write(isolated_file, {"isolated": True})
+        self.assertTrue(os.path.exists(isolated_file))
+
+        # 3. Actual OS-user ~/.gemini remains blocked
+        prod_gemini = config._REAL_PRODUCTION_GEMINI_DIR
+        with self.assertRaises(RuntimeError) as cm_prod:
+            config._assert_safe_write_path(prod_gemini)
+        self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_prod.exception))
+
+        with self.assertRaises(RuntimeError) as cm_prod_file:
+            config._assert_safe_write_path(os.path.join(prod_gemini, "agy-pool-accounts.json"))
+        self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_prod_file.exception))
+
+        # 4. Symlink into production remains blocked
+        symlink_to_prod = os.path.join(self.temp.name, "symlink_to_production")
+        if os.path.exists(symlink_to_prod):
+            os.unlink(symlink_to_prod)
+        os.symlink(prod_gemini, symlink_to_prod)
+        with self.assertRaises(RuntimeError) as cm_sym:
+            config._assert_safe_write_path(os.path.join(symlink_to_prod, "accounts.json"))
+        self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_sym.exception))
+        with self.assertRaises(RuntimeError) as cm_sym_dir:
+            config._assert_safe_write_path(symlink_to_prod)
+        self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_sym_dir.exception))
+
+        # 5. Prefix collision such as ~/.gemini-backup is not falsely blocked
+        parent_dir = os.path.dirname(prod_gemini)
+        prefix_backup = os.path.join(parent_dir, ".gemini-backup")
+        prefix_file = os.path.join(prefix_backup, "backup.json")
+        try:
+            config._assert_safe_write_path(prefix_file)
+            config._assert_safe_write_path(prefix_backup)
+        except RuntimeError as e:
+            self.fail(f"Prefix collision was falsely blocked: {e}")
+
+        # 6. Test cleanup can restore configure_paths() to its original isolated temporary path without RuntimeError
+        temp_outer = os.path.join(self.temp.name, "outer_temp_gemini")
+        temp_inner = os.path.join(self.temp.name, "inner_temp_gemini")
+        config.configure_paths(temp_outer)
+        self.assertEqual(config.GEMINI_DIR, temp_outer)
+        config.configure_paths(temp_inner)
+        self.assertEqual(config.GEMINI_DIR, temp_inner)
+        config.configure_paths(temp_outer)
+        self.assertEqual(config.GEMINI_DIR, temp_outer)
+        config.configure_paths(os.path.join(self.temp.name, ".gemini"))
+
 
 if __name__ == "__main__":
     unittest.main()
