@@ -27,7 +27,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from agy_pool import config, storage, auth, accounts, quota, scheduler, proxy
+from agy_pool import config, storage, auth, accounts, quota, scheduler, proxy, daemon
 
 SCRIPT = os.path.join(ROOT, "bin", "agy-pool")
 loader = importlib.machinery.SourceFileLoader("agy_pool_bin", SCRIPT)
@@ -3525,6 +3525,67 @@ class AgyPoolTest(unittest.TestCase):
         acc_rec2 = pool_state2["accounts"][0]
         self.assertEqual(acc_rec2.get("gen_count"), 1)
         self.assertEqual(acc_rec2.get("request_count"), 2)
+
+    def test_cp5b_modularization_daemon_extraction(self):
+        """Comprehensive verification for CP5B daemon modularization and process lifecycle preservation."""
+        # 1. Symbol export parity
+        self.assertIs(agy_pool.start_proxy_daemon, daemon.start_proxy_daemon)
+        self.assertIs(agy_pool.stop_proxy_daemon, daemon.stop_proxy_daemon)
+        self.assertIs(agy_pool.get_daemon_info, daemon.get_daemon_info)
+        self.assertIs(agy_pool.get_daemon_pid, daemon.get_daemon_pid)
+        self.assertIs(agy_pool.is_port_listening, daemon.is_port_listening)
+        self.assertIs(agy_pool.is_daemon_running, daemon.is_daemon_running)
+        self.assertIs(agy_pool.is_daemon_outdated, daemon.is_daemon_outdated)
+        self.assertIs(agy_pool.ensure_daemon_running, daemon.ensure_daemon_running)
+        self.assertIs(agy_pool.rotate_log_if_needed, daemon.rotate_log_if_needed)
+        self.assertIs(agy_pool.clear_log, daemon.clear_log)
+        self.assertIs(agy_pool._maybe_rotate_log, daemon._maybe_rotate_log)
+        self.assertIs(agy_pool._format_size, daemon._format_size)
+
+        # 2. Entrypoint isolation & resolver verification
+        entrypoint = daemon.get_entrypoint_path()
+        self.assertTrue(os.path.exists(entrypoint))
+        self.assertTrue(entrypoint.endswith("bin/agy-pool") or entrypoint.endswith("bin/agy-pool.py"))
+        self.assertNotIn("daemon.py", entrypoint)
+
+        # Background launch command uses entrypoint, not daemon.py
+        mock_proc = mock.MagicMock()
+        mock_proc.poll.return_value = None
+        with mock.patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
+             mock.patch.object(agy_pool, "is_daemon_running", side_effect=[False, True]), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=99999):
+            agy_pool.start_proxy_daemon(foreground=False)
+            mock_popen.assert_called_once()
+            cmd_launched = mock_popen.call_args[0][0]
+            self.assertEqual(cmd_launched[0], sys.executable)
+            self.assertEqual(cmd_launched[1], os.path.abspath(entrypoint))
+            self.assertEqual(cmd_launched[2], "daemon-run")
+
+        # 3. Format size checks
+        self.assertEqual(daemon._format_size(500), "500 B")
+        self.assertEqual(daemon._format_size(2048), "2.0 KB")
+        self.assertEqual(daemon._format_size(5 * 1024 * 1024), "5.0 MB")
+
+        # 4. Fail-closed test guard on daemon paths
+        with tempfile.TemporaryDirectory() as protected_dir:
+            config.register_forbidden_path(protected_dir)
+            forbidden_log = os.path.join(protected_dir, "bad.log")
+            with self.assertRaises(RuntimeError):
+                daemon.rotate_log_if_needed(log_path=forbidden_log)
+            with self.assertRaises(RuntimeError):
+                daemon.clear_log(log_path=forbidden_log)
+
+        # 5. Outdated detection preserves behavior
+        my_pid = os.getpid()
+        meta = {"pid": my_pid, "version": config.VERSION, "script_mtime": int(time.time()) + 1000}
+        with open(config.PID_FILE, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        with mock.patch.object(agy_pool, "is_port_listening", return_value=True):
+            self.assertFalse(daemon.is_daemon_outdated())
+            meta["version"] = "0.0.1-old"
+            with open(config.PID_FILE, "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+            self.assertTrue(daemon.is_daemon_outdated())
 
 
 if __name__ == "__main__":

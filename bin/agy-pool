@@ -47,6 +47,7 @@ from agy_pool import accounts
 from agy_pool import quota
 from agy_pool import scheduler
 from agy_pool import proxy
+from agy_pool import daemon
 
 # Re-export fcntl and configuration constants / functions
 HAS_FCNTL = config.HAS_FCNTL
@@ -233,6 +234,18 @@ proxy.set_token_refresher(lambda *a, **k: refresh_token(*a, **k))
 proxy.set_quota_refresher(lambda *a, **k: schedule_quota_refresh(*a, **k))
 proxy.set_log_rotator(lambda *a, **k: _maybe_rotate_log(*a, **k))
 
+daemon.set_entrypoint_path(os.path.abspath(__file__))
+daemon.set_pid_file_provider(lambda: PID_FILE)
+daemon.set_log_file_provider(lambda: LOG_FILE)
+daemon.set_port_provider(lambda: DEFAULT_PORT)
+daemon.set_version_provider(lambda: VERSION)
+daemon.set_port_listener(lambda *a, **k: is_port_listening(*a, **k))
+daemon.set_daemon_runner(lambda *a, **k: is_daemon_running(*a, **k))
+daemon.set_daemon_outdated_checker(lambda *a, **k: is_daemon_outdated(*a, **k))
+daemon.set_daemon_pid_getter(lambda *a, **k: get_daemon_pid(*a, **k))
+daemon.set_daemon_stopper(lambda *a, **k: stop_proxy_daemon(*a, **k))
+daemon.set_daemon_starter(lambda *a, **k: start_proxy_daemon(*a, **k))
+
 
 accounts.set_quota_prober(lambda *args, **kwargs: query_quota(*args, **kwargs), _format_account_quota_summary)
 
@@ -416,126 +429,12 @@ import_pool = accounts.import_pool
 
 
 # ----------------- Log Management & Rotation -----------------
-_LAST_LOG_ROTATE_CHECK = 0
-_LOG_ROTATE_INTERVAL = 30  # seconds between size checks in active request loop
-
-
-def _format_size(bytes_val):
-    if bytes_val < 1024:
-        return f"{bytes_val} B"
-    elif bytes_val < 1024 * 1024:
-        return f"{bytes_val / 1024:.1f} KB"
-    else:
-        return f"{bytes_val / (1024 * 1024):.1f} MB"
-
-
-def rotate_log_if_needed(log_path=None, max_bytes=None, backup_count=None, force=False):
-    """
-    Performs copytruncate log rotation if the file exceeds max_bytes (or force=True).
-    Retains open file descriptors without disruption to running background daemons.
-    Returns True if rotated, False otherwise.
-    """
-    if log_path is None:
-        log_path = LOG_FILE
-    if max_bytes is None:
-        max_bytes = MAX_LOG_BYTES
-    if backup_count is None:
-        backup_count = BACKUP_LOG_COUNT
-    _assert_safe_write_path(log_path)
-    if not os.path.exists(log_path):
-        return False
-    if not force:
-        try:
-            if os.path.getsize(log_path) < max_bytes:
-                return False
-        except OSError:
-            return False
-
-    lock_file = log_path + ".lock"
-    try:
-        with _file_lock(lock_file):
-            if not os.path.exists(log_path):
-                return False
-            if not force:
-                try:
-                    if os.path.getsize(log_path) < max_bytes:
-                        return False
-                except OSError:
-                    return False
-
-            # Shift existing backups: .2 -> .3, .1 -> .2, etc.
-            for i in range(backup_count - 1, 0, -1):
-                src = f"{log_path}.{i}"
-                dst = f"{log_path}.{i + 1}"
-                if os.path.exists(src):
-                    try:
-                        os.replace(src, dst)
-                    except OSError:
-                        pass
-
-            if backup_count > 0:
-                backup_dst = f"{log_path}.1"
-                try:
-                    shutil.copyfile(log_path, backup_dst)
-                except OSError:
-                    pass
-
-            # In-place truncation preserving open file descriptors (copytruncate)
-            try:
-                with open(log_path, "r+", encoding="utf-8", errors="ignore") as f:
-                    f.truncate(0)
-                    f.flush()
-            except OSError:
-                try:
-                    with open(log_path, "w", encoding="utf-8", errors="ignore"):
-                        pass
-                except OSError:
-                    pass
-            return True
-    except Exception as e:
-        try:
-            sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [LOG ROTATE ERROR] {e}\n")
-            sys.stderr.flush()
-        except Exception:
-            pass
-        return False
-
-
-def clear_log(log_path=None, backup_count=None):
-    """Safely clears/truncates active log file and removes backup logs."""
-    if log_path is None:
-        log_path = LOG_FILE
-    if backup_count is None:
-        backup_count = BACKUP_LOG_COUNT
-    _assert_safe_write_path(log_path)
-    lock_file = log_path + ".lock"
-    with _file_lock(lock_file):
-        if os.path.exists(log_path):
-            try:
-                with open(log_path, "r+", encoding="utf-8", errors="ignore") as f:
-                    f.truncate(0)
-                    f.flush()
-            except OSError:
-                try:
-                    with open(log_path, "w", encoding="utf-8", errors="ignore"):
-                        pass
-                except OSError:
-                    pass
-        for i in range(1, backup_count + 2):
-            b_path = f"{log_path}.{i}"
-            if os.path.exists(b_path):
-                try:
-                    os.remove(b_path)
-                except OSError:
-                    pass
-
-
-def _maybe_rotate_log():
-    global _LAST_LOG_ROTATE_CHECK
-    now = time.time()
-    if now - _LAST_LOG_ROTATE_CHECK >= _LOG_ROTATE_INTERVAL:
-        _LAST_LOG_ROTATE_CHECK = now
-        rotate_log_if_needed()
+_LAST_LOG_ROTATE_CHECK = daemon._LAST_LOG_ROTATE_CHECK
+_LOG_ROTATE_INTERVAL = daemon._LOG_ROTATE_INTERVAL
+_format_size = daemon._format_size
+rotate_log_if_needed = daemon.rotate_log_if_needed
+clear_log = daemon.clear_log
+_maybe_rotate_log = daemon._maybe_rotate_log
 
 
 def show_logs(lines=20, follow=False, clear=False, rotate=False):
@@ -644,195 +543,15 @@ _record_auth_error = proxy._record_auth_error
 
 
 
-def start_proxy_daemon(foreground=False):
-    rotate_log_if_needed()
-    if not foreground:
-        if is_daemon_running():
-            if is_daemon_outdated():
-                pid = get_daemon_pid()
-                print(f"{CLR_CYAN}Proxy daemon (PID: {pid}) is running outdated code. Restarting...{CLR_RESET}")
-                stop_proxy_daemon()
-                time.sleep(0.5)
-            else:
-                print(f"{CLR_YELLOW}Proxy daemon is already running (PID: {get_daemon_pid()}).{CLR_RESET}")
-                return
-
-        # Launch background process
-        _assert_safe_write_path(LOG_FILE)
-        _assert_safe_write_path(PID_FILE)
-        cmd = [sys.executable, os.path.abspath(__file__), "daemon-run"]
-        ensure_dirs()
-        log_fd = os.open(LOG_FILE, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
-        os.fchmod(log_fd, 0o600)
-        with os.fdopen(log_fd, "a") as logf:
-            p = subprocess.Popen(cmd, stdout=logf, stderr=logf, start_new_session=True)
-        for _ in range(20):
-            if is_daemon_running() or p.poll() is not None:
-                break
-            time.sleep(0.1)
-        pid = get_daemon_pid()
-        if pid:
-            print(f"{CLR_GREEN}✓ Antigravity load balancer gateway started on http://127.0.0.1:{DEFAULT_PORT} (PID: {pid}){CLR_RESET}")
-        elif p.poll() is not None and is_daemon_running():
-            return
-        else:
-            print(f"{CLR_RED}[Error] Failed to start gateway. Check {LOG_FILE}{CLR_RESET}")
-        return
-
-    # Foreground runner
-    try:
-        with _file_lock(PID_FILE + ".lock", blocking=False):
-            def stop_server(signum, frame):
-                raise SystemExit(0)
-
-            signal.signal(signal.SIGTERM, stop_server)
-            signal.signal(signal.SIGINT, stop_server)
-            try:
-                curr_script = os.path.realpath(__file__)
-                curr_mtime = int(os.path.getmtime(curr_script)) if os.path.exists(curr_script) else int(time.time())
-                _atomic_json_write(PID_FILE, {
-                    "pid": os.getpid(),
-                    "version": VERSION,
-                    "script_mtime": curr_mtime,
-                })
-
-                def background_refresher():
-                    while True:
-                        time.sleep(180)
-                        for acc in load_pool().get("accounts", []):
-                            if quota_refresh_needed(acc):
-                                schedule_quota_refresh(acc)
-
-                threading.Thread(target=background_refresher, daemon=True).start()
-                server = ThreadedHTTPServer(("127.0.0.1", DEFAULT_PORT), SmartProxyHandler)
-                try:
-                    server.serve_forever()
-                finally:
-                    server.server_close()
-            finally:
-                try:
-                    with open(PID_FILE, "r", encoding="utf-8") as f:
-                        raw = f.read().strip()
-                    file_pid = None
-                    if raw.startswith("{"):
-                        file_pid = int(json.loads(raw).get("pid", 0))
-                    elif raw:
-                        file_pid = int(raw)
-                    if file_pid == os.getpid():
-                        _assert_safe_write_path(PID_FILE)
-                        os.unlink(PID_FILE)
-                except (OSError, ValueError, json.JSONDecodeError):
-                    pass
-    except BlockingIOError:
-        return
-
-
-def stop_proxy_daemon():
-    pid = get_daemon_pid()
-    if not pid:
-        print(f"{CLR_YELLOW}Proxy daemon is not running.{CLR_RESET}")
-        return
-    try:
-        os.kill(pid, signal.SIGTERM)
-        for _ in range(30):
-            if get_daemon_pid() is None:
-                break
-            time.sleep(0.1)
-        if get_daemon_pid() is None:
-            print(f"{CLR_GREEN}✓ Proxy daemon (PID: {pid}) stopped.{CLR_RESET}")
-        else:
-            print(f"{CLR_YELLOW}Proxy daemon (PID: {pid}) is still stopping.{CLR_RESET}")
-    except ProcessLookupError:
-        print(f"{CLR_YELLOW}Process {pid} already dead.{CLR_RESET}")
-    except Exception as e:
-        print(f"{CLR_RED}[Error] Failed to stop daemon: {e}{CLR_RESET}")
-    finally:
-        if get_daemon_pid() is None and os.path.exists(PID_FILE):
-            _assert_safe_write_path(PID_FILE)
-            try:
-                os.remove(PID_FILE)
-            except OSError:
-                pass
-
-
-def get_daemon_info():
-    if not os.path.exists(PID_FILE):
-        return None
-    try:
-        with open(PID_FILE, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-        if content.startswith("{"):
-            data = json.loads(content)
-            pid = int(data.get("pid", 0))
-            version = data.get("version")
-            script_mtime = data.get("script_mtime")
-        else:
-            pid = int(content)
-            version = None
-            script_mtime = None
-        os.kill(pid, 0)
-        cmdline_path = f"/proc/{pid}/cmdline"
-        if os.path.exists(cmdline_path):
-            with open(cmdline_path, "rb") as f:
-                cmd = f.read().decode(errors="ignore")
-                if "agy-pool" not in cmd and "python" not in cmd:
-                    return None
-        return {"pid": pid, "version": version, "script_mtime": script_mtime}
-    except Exception:
-        return None
-
-
-def get_daemon_pid():
-    info = get_daemon_info()
-    return info["pid"] if info else None
-
-
-def is_port_listening(port=DEFAULT_PORT):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.3)
-        return s.connect_ex(("127.0.0.1", port)) == 0
-
-
-def is_daemon_running():
-    pid = get_daemon_pid()
-    if not pid:
-        return False
-    return is_port_listening()
-
-
-def is_daemon_outdated():
-    info = get_daemon_info()
-    if not info or not is_port_listening():
-        return False
-    running_ver = info.get("version")
-    if not running_ver or running_ver != VERSION:
-        return True
-    try:
-        curr_script = os.path.realpath(__file__)
-        if os.path.exists(curr_script):
-            curr_mtime = int(os.path.getmtime(curr_script))
-            daemon_mtime = info.get("script_mtime")
-            if daemon_mtime and curr_mtime > daemon_mtime:
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def ensure_daemon_running():
-    """
-    Ensures proxy daemon is running AND running the current version/script code.
-    If daemon is running outdated code or stopped, automatically restarts it.
-    """
-    if not is_daemon_running():
-        start_proxy_daemon(foreground=False)
-    elif is_daemon_outdated():
-        pid = get_daemon_pid()
-        sys.stderr.write(f"{CLR_CYAN}[agy-pool] Hot-reloading gateway daemon with latest updates (PID {pid})...{CLR_RESET}\n")
-        sys.stderr.flush()
-        stop_proxy_daemon()
-        time.sleep(0.5)
-        start_proxy_daemon(foreground=False)
+# ----------------- Daemon Lifecycle & Management -----------------
+start_proxy_daemon = daemon.start_proxy_daemon
+stop_proxy_daemon = daemon.stop_proxy_daemon
+get_daemon_info = daemon.get_daemon_info
+get_daemon_pid = daemon.get_daemon_pid
+is_port_listening = daemon.is_port_listening
+is_daemon_running = daemon.is_daemon_running
+is_daemon_outdated = daemon.is_daemon_outdated
+ensure_daemon_running = daemon.ensure_daemon_running
 
 
 def run_doctor():
